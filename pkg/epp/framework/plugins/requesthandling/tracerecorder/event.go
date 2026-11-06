@@ -43,7 +43,9 @@ const TerminationNatural = "natural"
 type Event struct {
 	Version          int      `json:"v"`
 	KeyFingerprint   string   `json:"key_fingerprint"`
+	CaptureRunID     string   `json:"capture_run_id,omitempty"`
 	SessionID        string   `json:"session_id"`
+	ParentSessionID  string   `json:"parent_session_id,omitempty"`
 	SessionSource    string   `json:"session_source"`
 	CacheSaltID      string   `json:"cache_salt_id"`
 	AgentID          string   `json:"agent_id"`
@@ -58,8 +60,11 @@ type Event struct {
 	TokenizerBackend string   `json:"tokenizer_backend"`
 	BlockSize        int      `json:"block_size"`
 	In               int      `json:"in"`
+	UsageIn          int      `json:"usage_in,omitempty"`
+	CachedTokens     int      `json:"cached_tokens,omitempty"`
 	Out              int      `json:"out"`
 	OutSource        string   `json:"out_source"`
+	MaxOutputTokens  *int64   `json:"max_output_tokens,omitempty"`
 	MsgCount         int      `json:"msg_count"`
 	HasSystemPrompt  bool     `json:"has_system_prompt"`
 	HasTools         bool     `json:"has_tools"`

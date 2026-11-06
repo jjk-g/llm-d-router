@@ -324,6 +324,127 @@ class VerifyOracleTests(unittest.TestCase):
             self.assertTrue(any("response ext-proc p99 overhead" in e for e in res["errors"]))
             self.assertTrue(any("summed hot-path plugin p99" in e for e in res["errors"]))
 
+    def test_gate5_passes_on_valid_agentx_smoke_fixture(self) -> None:
+        fixture = Path(__file__).resolve().parent / "agentx_smoke_fixture.jsonl"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            # Synthesize raw captured EPP records matching the 10 turns in agentx_smoke_fixture.jsonl
+            traces = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines() if line.strip()]
+            raw_records = []
+            for tr in traces:
+                for req in tr["requests"]:
+                    if req["type"] == "subagent":
+                        for ireq in req["requests"]:
+                            raw_records.append(
+                                {
+                                    "v": 1,
+                                    "session_id": tr["id"],
+                                    "agent_id": req["agent_id"],
+                                    "subagent_type": req["subagent_type"],
+                                    "block_size": tr["block_size"],
+                                    "in": ireq["in"],
+                                    "tokenized_in": ireq["in"],
+                                    "usage_in": ireq["in"],
+                                    "out": ireq["out"],
+                                    "hash_ids": ireq["hash_ids"],
+                                }
+                            )
+                    else:
+                        raw_records.append(
+                            {
+                                "v": 1,
+                                "session_id": tr["id"],
+                                "block_size": tr["block_size"],
+                                "in": req["in"],
+                                "tokenized_in": req["in"],
+                                "usage_in": req["in"],
+                                "out": req["out"],
+                                "hash_ids": req["hash_ids"],
+                            }
+                        )
+            (raw_dir / "capture.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in raw_records) + "\n", encoding="utf-8"
+            )
+            replay_report = root / "replay_report.json"
+            replay_report.write_text(
+                json.dumps(
+                    {
+                        "total_requests": 10,
+                        "completed_requests": 10,
+                        "failed_requests": 0,
+                        "errors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            res = verify_oracle.verify_gate5(
+                source_path=fixture,
+                exported_path=fixture,
+                captured_raw_path=raw_dir,
+                replay_report_json=replay_report,
+            )
+            self.assertTrue(res["passed"], res["errors"])
+            self.assertEqual(res["schema_validation"]["clamped_request_count"], 0)
+            self.assertEqual(res["block_invariant"]["turns_checked"], 10)
+            self.assertEqual(res["block_invariant"]["violations"], 0)
+            self.assertEqual(res["tokenizer_parity"]["violations"], 0)
+            self.assertEqual(res["structural_lineage"]["root_sessions_exported"], 2)
+            self.assertEqual(res["structural_lineage"]["subagents_exported"], 2)
+            self.assertEqual(res["lcp_fidelity"]["max_observed_lcp_diff"], 0)
+            self.assertAlmostEqual(res["lcp_fidelity"]["pearson_r"], 1.0)
+            self.assertTrue(res["round_trip_replay"]["verified"])
+
+    def test_gate5_fails_on_schema_clamped_block_tokenizer_lcp_and_replay_violations(self) -> None:
+        fixture = Path(__file__).resolve().parent / "agentx_smoke_fixture.jsonl"
+        traces = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines() if line.strip()]
+        bad_traces = json.loads(json.dumps(traces))
+        # 1. Extra forbidden aiperf field & forbidden raw key
+        bad_traces[0]["unexpected_extra_field"] = "bad"
+        bad_traces[0]["requests"][0]["messages"] = [{"role": "user", "content": "leak"}]
+        # 2. Block invariant violation (in=64 at block_size=16 expects 4 hashes, give 3)
+        bad_traces[0]["requests"][0]["hash_ids"] = [1, 2, 3]
+        # 3. Subagent clamped timestamp violation (req.t < subagent.t) & wrong inner type
+        bad_traces[0]["requests"][1]["requests"][0]["t"] = 0.05  # < subagent.t=0.1
+        bad_traces[0]["requests"][1]["requests"][0]["type"] = "s"
+        # 4. LCP drift on parent turn 1
+        bad_traces[0]["requests"][2]["hash_ids"] = [91, 92, 93, 94, 95, 96]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exp_file = root / "bad_exported.jsonl"
+            exp_file.write_text("\n".join(json.dumps(t) for t in bad_traces) + "\n", encoding="utf-8")
+
+            raw_file = root / "bad_raw.jsonl"
+            raw_file.write_text(
+                json.dumps({"v": 1, "tokenized_in": 64, "usage_in": 50, "prompt": "secret"}) + "\n",
+                encoding="utf-8",
+            )
+            replay_report = root / "bad_replay.json"
+            replay_report.write_text(
+                json.dumps({"total_requests": 10, "completed_requests": 8, "failed_requests": 2, "errors": ["HTTP 500"]}),
+                encoding="utf-8",
+            )
+
+            res = verify_oracle.verify_gate5(
+                source_path=fixture,
+                exported_path=exp_file,
+                captured_raw_path=raw_file,
+                replay_report_json=replay_report,
+            )
+            self.assertFalse(res["passed"])
+            self.assertGreaterEqual(res["schema_validation"]["clamped_request_count"], 1)
+            self.assertGreaterEqual(res["block_invariant"]["violations"], 1)
+            self.assertGreaterEqual(res["tokenizer_parity"]["violations"], 1)
+            self.assertTrue(any("extra='forbid'" in e for e in res["errors"]))
+            self.assertTrue(any("forbidden raw payload keys" in e for e in res["errors"]))
+            self.assertTrue(any("clamped_request_count violation" in e for e in res["errors"]))
+            self.assertTrue(any("violated block invariant" in e for e in res["errors"]))
+            self.assertTrue(any("LCP drift" in e for e in res["errors"]))
+            self.assertTrue(any("Round-trip replay incomplete" in e for e in res["errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -895,6 +895,106 @@ run_gate4() {
   log "Gate 4 PASSED! Report: ${RUN_DIR}/gate4_oracle_report.json"
 }
 
+resolve_gate5_python() {
+  if [[ -x "${INFERENCE_PERF_DIR}/.venv/bin/python" ]]; then
+    echo "${INFERENCE_PERF_DIR}/.venv/bin/python"
+  else
+    command -v python3
+  fi
+}
+
+run_gate5_local() {
+  log "=== Gate 5 (Local Hermetic Live-EPP Mode): AgentX Smoke Tests (aiperf & inference-perf) ==="
+  local py_bin
+  py_bin="$(resolve_gate5_python)"
+  local report_path="${GATE5_REPORT_JSON:-${REPO_ROOT}/gate5_oracle_report.json}"
+
+  PYTHONPATH="${INFERENCE_PERF_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "${py_bin}" \
+    "${HARNESS_DIR}/run_agentx_smoke.py" \
+    --mode local \
+    --fixture "${HARNESS_DIR}/agentx_smoke_fixture.jsonl" \
+    --work-dir "${RUN_DIR}/gate5_local" \
+    --inference-perf-dir "${INFERENCE_PERF_DIR}" \
+    --output-json "${RUN_DIR}/gate5_oracle_report.json"
+
+  cp "${RUN_DIR}/gate5_oracle_report.json" "${report_path}"
+  log "Gate 5 (local) PASSED! Reports: ${RUN_DIR}/gate5_oracle_report.json and ${report_path}"
+}
+
+run_gate5() {
+  preflight
+  ensure_namespace_and_secret
+
+  log "=== Gate 5: Deploying vLLM simulator + EPP trace-router stack for AgentX Smoke Tests ==="
+  kubectl --context="${K8S_CONTEXT}" -n "${NAMESPACE}" delete deployment vllm-trace-real --ignore-not-found --wait=true >/dev/null
+  deploy_router "${RUN_ID}/gate5/suite1" "trace-gate-plugins.yaml"
+  deploy_model_backend "${HARNESS_DIR}/manifests/vllm-sim.yaml"
+
+  local py_bin
+  py_bin="$(resolve_gate5_python)"
+  local s1_raw="${RUN_DIR}/gate5_cluster/suite1_captured"
+  local s2_raw="${RUN_DIR}/gate5_cluster/suite2_captured"
+  mkdir -p "${s1_raw}" "${s2_raw}"
+
+  log "=== Gate 5 Suite 1 (aiperf AgentX workflow on GKE) ==="
+  start_port_forward "svc/${RELEASE_NAME}-proxy" "18081:8081" "${RUN_DIR}/pf-envoy-g5-s1.log"
+  PYTHONPATH="${INFERENCE_PERF_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "${py_bin}" - <<EOF
+from pathlib import Path
+import sys
+sys.path.insert(0, "${HARNESS_DIR}")
+import run_agentx_smoke
+res = run_agentx_smoke.run_aiperf_agentx_driver(
+    traces_path=Path("${HARNESS_DIR}/agentx_smoke_fixture.jsonl"),
+    base_url="http://127.0.0.1:18081",
+    model_override="${MODEL_NAME}",
+    exercise_transitive_depth2=True,
+)
+assert res["failed_requests"] == 0 and res["completed_requests"] == res["total_requests"], res
+EOF
+  stop_port_forwards
+  seal_and_fetch_gcs_traces "${RUN_ID}/gate5/suite1" "${s1_raw}" 2 false
+
+  log "=== Gate 5 Suite 2 (inference-perf AgentX workflow on GKE) ==="
+  deploy_router "${RUN_ID}/gate5/suite2" "trace-gate-plugins.yaml"
+  start_port_forward "svc/${RELEASE_NAME}-proxy" "18081:8081" "${RUN_DIR}/pf-envoy-g5-s2.log"
+  PYTHONPATH="${INFERENCE_PERF_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "${py_bin}" - <<EOF
+from pathlib import Path
+import sys
+sys.path.insert(0, "${HARNESS_DIR}")
+import run_agentx_smoke
+res = run_agentx_smoke.run_inference_perf_weka_replay(
+    traces_source=Path("${HARNESS_DIR}/agentx_smoke_fixture.jsonl"),
+    base_url="http://127.0.0.1:18081",
+    work_dir=Path("${RUN_DIR}/gate5_cluster/s2_work"),
+    inference_perf_dir=Path("${INFERENCE_PERF_DIR}"),
+    model_name="${MODEL_NAME}",
+    block_size=16,
+)
+assert res["failed_requests"] == 0 and res["completed_requests"] == res["total_requests"], res
+EOF
+  stop_port_forwards
+  seal_and_fetch_gcs_traces "${RUN_ID}/gate5/suite2" "${s2_raw}" 2 false
+
+  log "=== Gate 5 Export, Oracle Validation & Round-Trip Replay ==="
+  deploy_router "${RUN_ID}/gate5/replay" "no-recorder-plugins.yaml"
+  start_port_forward "svc/${RELEASE_NAME}-proxy" "18081:8081" "${RUN_DIR}/pf-envoy-g5-replay.log"
+  local report_path="${GATE5_REPORT_JSON:-${REPO_ROOT}/gate5_oracle_report.json}"
+  PYTHONPATH="${INFERENCE_PERF_DIR}${PYTHONPATH:+:${PYTHONPATH}}" "${py_bin}" \
+    "${HARNESS_DIR}/run_agentx_smoke.py" \
+    --mode cluster \
+    --base-url "http://127.0.0.1:18081" \
+    --cluster-captured-dir-suite1 "${s1_raw}" \
+    --cluster-captured-dir-suite2 "${s2_raw}" \
+    --fixture "${HARNESS_DIR}/agentx_smoke_fixture.jsonl" \
+    --work-dir "${RUN_DIR}/gate5_cluster" \
+    --inference-perf-dir "${INFERENCE_PERF_DIR}" \
+    --model-name "${MODEL_NAME}" \
+    --output-json "${RUN_DIR}/gate5_oracle_report.json"
+  stop_port_forwards
+  cp "${RUN_DIR}/gate5_oracle_report.json" "${report_path}"
+  log "Gate 5 PASSED! Reports: ${RUN_DIR}/gate5_oracle_report.json and ${report_path}"
+}
+
 usage() {
   local bucket_disp="${TRACE_GCS_BUCKET:-<TRACE_GCS_BUCKET>}"
   local project_disp="${GCP_PROJECT:-<GCP_PROJECT>}"
@@ -909,7 +1009,9 @@ Subcommands:
   validate-local  Run offline helm template + oracle unit tests only
   gate3           Run Gate 3 (2x llm-d-inference-sim closed-loop trace isomorphism)
   gate4           Run Gate 4 (1x real vLLM prefix-cache parity & 200-req p99 overhead)
-  all             Run create-bucket -> build-push -> preflight -> gate3 -> gate4
+  gate5-local     Run Gate 5 AgentX smoke tests (aiperf & inference-perf) against local hermetic EPP stack
+  gate5           Run Gate 5 AgentX smoke tests (aiperf & inference-perf) on GKE cluster
+  all             Run create-bucket -> build-push -> preflight -> gate3 -> gate4 -> gate5
 EOF
 }
 
@@ -934,12 +1036,19 @@ main() {
     gate4)
       run_gate4
       ;;
+    gate5-local)
+      run_gate5_local
+      ;;
+    gate5)
+      run_gate5
+      ;;
     all)
       create_bucket
       build_push
       preflight
       KEEP_NAMESPACE="true" run_gate3
-      run_gate4
+      KEEP_NAMESPACE="true" run_gate4
+      run_gate5
       ;;
     -h|--help|"")
       usage

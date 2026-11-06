@@ -45,6 +45,7 @@ import (
 	sessionidconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/dataproducer/sessionid/constants"
 	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/requestheader/agentidentity"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/util/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
@@ -55,23 +56,27 @@ const (
 
 	// DefaultBlockSizeTokens is the default KV-cache block size in tokens (matching vLLM).
 	DefaultBlockSizeTokens = 16
+
+	// Client and harness session/subagent correlation headers not defined in shared router packages.
+	HeaderDynamoSessionID       = "x-dynamo-session-id"
+	HeaderDynamoParentSessionID = "x-dynamo-parent-session-id"
+	HeaderCorrelationID         = "x-correlation-id"
+	HeaderSMGRoutingKey         = "x-smg-routing-key"
+	HeaderClaudeCodeAgentID     = "x-claude-code-agent-id"
+
+	subagentSessionDelimiter = "::sa:"
+
+	dropReasonBufferFull = "buffer_full"
+	dropReasonSinkClosed = "sink_closed"
+	dropReasonWriteError = "write_error"
+
+	skipReasonSampledOut   = "sampled_out"
+	skipReasonNoTokens     = "no_tokens"
+	skipReasonNonCompleted = "non_completed"
 )
 
-// Explicit request headers inspected for session, agent_id, and subagent_type resolution.
+// Explicit request headers inspected for subagent_type resolution.
 var (
-	explicitSessionHeaders = []string{
-		agentidentity.ClaudeCodeSessionHeader,
-		agentidentity.OpenCodeSessionHeader,
-		agentidentity.CodexSessionHeader,
-		agentidentity.CodexSessionHeaderLegacy,
-		"x-session-id",
-		metadata.FlowFairnessIDKey,
-	}
-	explicitAgentIDHeaders = []string{
-		"x-agent-id",
-		"x-claude-code-agent-id",
-		"x-llm-d-agent-id",
-	}
 	explicitSubagentTypeHeaders = []string{
 		"x-subagent-type",
 		"x-claude-code-subagent-type",
@@ -79,8 +84,45 @@ var (
 	}
 )
 
+// DefaultSessionSources returns the priority-ordered session sources used when
+// Config.SessionSources is unset.
+func DefaultSessionSources() []sessionaffinity.SessionIDSource {
+	return []sessionaffinity.SessionIDSource{
+		{Attribute: agentidentity.AgentIdentityKey.DataType()},
+		{Attribute: attrsession.SessionIDDataKey.DataType(), Producer: sessionidconstants.SessionIDProducerType},
+		{Header: sessionaffinity.DefaultSessionIDHeader},
+		{Header: HeaderDynamoSessionID},
+		{Header: HeaderCorrelationID},
+		{Header: HeaderSMGRoutingKey},
+		{Header: agentidentity.ClaudeCodeSessionHeader},
+		{Header: agentidentity.OpenCodeSessionHeader},
+		{Header: agentidentity.CodexSessionHeader},
+		{Header: agentidentity.CodexSessionHeaderLegacy},
+		{Header: metadata.FlowFairnessIDKey},
+	}
+}
+
+// DefaultParentSessionSources returns the priority-ordered parent session sources
+// used when Config.ParentSessionSources is unset.
+func DefaultParentSessionSources() []sessionaffinity.SessionIDSource {
+	return []sessionaffinity.SessionIDSource{
+		{Header: HeaderDynamoParentSessionID},
+	}
+}
+
+// DefaultSubagentSources returns the priority-ordered subagent identifier sources
+// used when Config.SubagentSources is unset.
+func DefaultSubagentSources() []sessionaffinity.SessionIDSource {
+	return []sessionaffinity.SessionIDSource{
+		{Header: "x-agent-id"},
+		{Header: HeaderClaudeCodeAgentID},
+		{Header: "x-llm-d-agent-id"},
+	}
+}
+
 var (
 	registerMetricsOnce sync.Once
+
 	droppedEventsMetric = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: "llm_d_epp",
@@ -89,12 +131,63 @@ var (
 		},
 		[]string{"plugin_name"},
 	)
+
+	writtenEventsMetric = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "llm_d_epp",
+			Name:      "trace_recorder_written_events_total",
+			Help:      "Total number of anonymized KV-block trace events persisted by the trace sink.",
+		},
+		[]string{"plugin_name"},
+	)
+
+	droppedRecordsMetric = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "llm_d_epp",
+			Name:      "trace_recorder_dropped_records_total",
+			Help:      "Total number of anonymized KV-block trace records dropped before persistence, by reason.",
+		},
+		[]string{"plugin_name", "reason"},
+	)
+
+	skippedRequestsMetric = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "llm_d_epp",
+			Name:      "trace_recorder_skipped_requests_total",
+			Help:      "Total number of inference requests skipped by the trace recorder, by reason.",
+		},
+		[]string{"plugin_name", "reason"},
+	)
+
+	rotationsMetric = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "llm_d_epp",
+			Name:      "trace_recorder_rotations_total",
+			Help:      "Total number of sealed trace segment rotations performed by the trace sink.",
+		},
+		[]string{"plugin_name"},
+	)
 )
 
 func registerRecorderMetrics() {
 	registerMetricsOnce.Do(func() {
-		_ = ctrlmetrics.Registry.Register(droppedEventsMetric)
+		registerRecorderMetricsOn(ctrlmetrics.Registry)
 	})
+}
+
+func registerRecorderMetricsOn(registerer prometheus.Registerer) {
+	if registerer == nil {
+		return
+	}
+	for _, c := range []prometheus.Collector{
+		droppedEventsMetric,
+		writtenEventsMetric,
+		droppedRecordsMetric,
+		skippedRequestsMetric,
+		rotationsMetric,
+	} {
+		_ = registerer.Register(c)
+	}
 }
 
 // Config configures the kv-block-trace-recorder plugin.
@@ -133,10 +226,19 @@ type Config struct {
 
 	// MaxSegmentBytes rotates the active staging segment once uncompressed JSONL bytes reach this size.
 	MaxSegmentBytes int64 `json:"maxSegmentBytes,omitempty"`
+	// MaxRotatedFiles bounds how many sealed .jsonl.gz files are retained in OutputDir (0 = unlimited).
+	MaxRotatedFiles int `json:"maxRotatedFiles,omitempty"`
 	// FlushInterval string duration (e.g. "30s") after which an open non-empty segment is sealed.
 	FlushInterval string `json:"flushInterval,omitempty"`
 	// BufferSize sets the non-blocking sink queue capacity (defaults to 4096).
 	BufferSize int `json:"bufferSize,omitempty"`
+
+	// SessionSources resolves the session identifier in priority order.
+	SessionSources []sessionaffinity.SessionIDSource `json:"sessionSources,omitempty"`
+	// ParentSessionSources resolves the parent session identifier for subagent requests.
+	ParentSessionSources []sessionaffinity.SessionIDSource `json:"parentSessionSources,omitempty"`
+	// SubagentSources resolves the subagent identifier within a parent session.
+	SubagentSources []sessionaffinity.SessionIDSource `json:"subagentSources,omitempty"`
 
 	// TokenizerBackendOverride is an optional test-only override ("vllm" or "estimate") used when
 	// constructing Recorder directly via NewRecorder without a plugin.Handle.
@@ -163,8 +265,30 @@ func (c Config) effectiveBlockSize() int {
 	return c.BlockSizeTokens
 }
 
+func (c Config) effectiveSessionSources() ([]sessionaffinity.SessionIDSource, bool) {
+	if len(c.SessionSources) == 0 {
+		return DefaultSessionSources(), true
+	}
+	return c.SessionSources, false
+}
+
+func (c Config) effectiveParentSessionSources() []sessionaffinity.SessionIDSource {
+	if len(c.ParentSessionSources) == 0 {
+		return DefaultParentSessionSources()
+	}
+	return c.ParentSessionSources
+}
+
+func (c Config) effectiveSubagentSources() []sessionaffinity.SessionIDSource {
+	if len(c.SubagentSources) == 0 {
+		return DefaultSubagentSources()
+	}
+	return c.SubagentSources
+}
+
 type pendingRecord struct {
 	sessionID        string
+	parentSessionID  string
 	sessionSource    string
 	cacheSaltID      string
 	agentID          string
@@ -173,6 +297,7 @@ type pendingRecord struct {
 	tokenizerBackend string
 	blockSize        int
 	inTokens         int
+	maxOutputTokens  *int64
 	msgCount         int
 	hasSystemPrompt  bool
 	hasTools         bool
@@ -183,37 +308,82 @@ type pendingRecord struct {
 	// In estimate mode, len(hashIDs) equals tokReq.TokenCount() / blockSize and
 	// may be further sliced in ResponseBody if response.Usage.PromptTokens < inTokens.
 	hashIDs []uint64
+
+	evictOnce sync.Once
+	onEvict   func()
 }
 
 func (r *pendingRecord) Clone() plugin.StateData {
 	if r == nil {
 		return nil
 	}
-	cp := *r
+	var maxOut *int64
+	if r.maxOutputTokens != nil {
+		v := *r.maxOutputTokens
+		maxOut = &v
+	}
+	cp := &pendingRecord{
+		sessionID:        r.sessionID,
+		parentSessionID:  r.parentSessionID,
+		sessionSource:    r.sessionSource,
+		cacheSaltID:      r.cacheSaltID,
+		agentID:          r.agentID,
+		subagentType:     r.subagentType,
+		model:            r.model,
+		tokenizerBackend: r.tokenizerBackend,
+		blockSize:        r.blockSize,
+		inTokens:         r.inTokens,
+		maxOutputTokens:  maxOut,
+		msgCount:         r.msgCount,
+		hasSystemPrompt:  r.hasSystemPrompt,
+		hasTools:         r.hasTools,
+		streaming:        r.streaming,
+		dispatched:       r.dispatched,
+		producedAt:       r.producedAt,
+	}
 	if r.hashIDs != nil {
 		cp.hashIDs = make([]uint64, len(r.hashIDs))
 		copy(cp.hashIDs, r.hashIDs)
 	}
-	return &cp
+	return cp
+}
+
+// OnEvicted decrements the Recorder's inFlight counter exactly once when a pendingRecord
+// is deleted or evicted from PluginState.
+func (r *pendingRecord) OnEvicted(_ string, _ plugin.StateKey) {
+	if r == nil {
+		return
+	}
+	r.evictOnce.Do(func() {
+		if r.onEvict != nil {
+			r.onEvict()
+		}
+	})
 }
 
 // Recorder implements the kv-block-trace-recorder EPP plugin.
 type Recorder struct {
-	typedName      plugin.TypedName
-	cfg            Config
-	secret         []byte
-	keyFingerprint string
-	sampleRateBPS  int
-	blockSize      int
-	tokenProc      kvblock.TokenProcessor
-	sink           TraceSink
-	clock          func() time.Time
-	pluginState    *plugin.PluginState
-	handle         plugin.Handle
+	typedName                 plugin.TypedName
+	cfg                       Config
+	secret                    []byte
+	keyFingerprint            string
+	captureRunID              string
+	sampleRateBPS             int
+	blockSize                 int
+	sessionSources            []sessionaffinity.SessionIDSource
+	parentSessionSources      []sessionaffinity.SessionIDSource
+	subagentSources           []sessionaffinity.SessionIDSource
+	useDefaultSessionFallback bool
+	tokenProc                 kvblock.TokenProcessor
+	sink                      TraceSink
+	clock                     func() time.Time
+	pluginState               *plugin.PluginState
+	handle                    plugin.Handle
 
 	backendOnce     sync.Once
 	resolvedBackend string
 
+	inFlight      atomic.Int64
 	recordedCount atomic.Uint64
 	droppedCount  atomic.Uint64
 }
@@ -221,6 +391,8 @@ type Recorder struct {
 // Compile-time interface assertions.
 var (
 	_ plugin.Plugin               = &Recorder{}
+	_ plugin.ConsumerPlugin       = &Recorder{}
+	_ plugin.StateDumper          = &Recorder{}
 	_ fwkrh.DataProducer          = &Recorder{}
 	_ fwkrh.RequestAbandoned      = &Recorder{}
 	_ fwkrh.PreRequest            = &Recorder{}
@@ -251,11 +423,17 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 		return nil, fmt.Errorf("%s: %w", PluginType, err)
 	}
 
+	if name == "" {
+		name = PluginType
+	}
+
 	sink, err := NewSealedGzipSink(SealedGzipSinkConfig{
 		OutputDir:       cfg.OutputDir,
 		StagingDir:      cfg.StagingDir,
 		PodName:         cfg.PodName,
+		PluginName:      name,
 		MaxSegmentBytes: cfg.MaxSegmentBytes,
+		MaxRotatedFiles: cfg.MaxRotatedFiles,
 		FlushInterval:   flushInterval,
 		BufferSize:      cfg.BufferSize,
 		Clock:           time.Now,
@@ -314,6 +492,24 @@ func newRecorderWithHandle(
 		return nil, err
 	}
 
+	captureRunID, err := GenerateCaptureRunID()
+	if err != nil {
+		return nil, err
+	}
+
+	sessionSources, usedDefaultSession := cfg.effectiveSessionSources()
+	if err := sessionaffinity.ValidateSources(sessionSources); err != nil {
+		return nil, fmt.Errorf("invalid sessionSources: %w", err)
+	}
+	parentSessionSources := cfg.effectiveParentSessionSources()
+	if err := sessionaffinity.ValidateSources(parentSessionSources); err != nil {
+		return nil, fmt.Errorf("invalid parentSessionSources: %w", err)
+	}
+	subagentSources := cfg.effectiveSubagentSources()
+	if err := sessionaffinity.ValidateSources(subagentSources); err != nil {
+		return nil, fmt.Errorf("invalid subagentSources: %w", err)
+	}
+
 	blockSize := cfg.effectiveBlockSize()
 	tokenProc, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{
 		BlockSizeTokens: blockSize,
@@ -325,19 +521,27 @@ func newRecorderWithHandle(
 	}
 
 	registerRecorderMetrics()
+	if handle != nil && handle.Metrics() != nil {
+		registerRecorderMetricsOn(handle.Metrics())
+	}
 
 	return &Recorder{
-		typedName:      plugin.TypedName{Type: PluginType, Name: name},
-		cfg:            cfg,
-		secret:         secret,
-		keyFingerprint: KeyFingerprint(secret),
-		sampleRateBPS:  cfg.effectiveSampleRateBPS(),
-		blockSize:      blockSize,
-		tokenProc:      tokenProc,
-		sink:           sink,
-		clock:          clock,
-		pluginState:    plugin.NewPluginState(ctx),
-		handle:         handle,
+		typedName:                 plugin.TypedName{Type: PluginType, Name: name},
+		cfg:                       cfg,
+		secret:                    secret,
+		keyFingerprint:            KeyFingerprint(secret),
+		captureRunID:              captureRunID,
+		sampleRateBPS:             cfg.effectiveSampleRateBPS(),
+		blockSize:                 blockSize,
+		sessionSources:            sessionSources,
+		parentSessionSources:      parentSessionSources,
+		subagentSources:           subagentSources,
+		useDefaultSessionFallback: usedDefaultSession,
+		tokenProc:                 tokenProc,
+		sink:                      sink,
+		clock:                     clock,
+		pluginState:               plugin.NewPluginState(ctx),
+		handle:                    handle,
 	}, nil
 }
 
@@ -349,6 +553,16 @@ func (r *Recorder) TypedName() plugin.TypedName {
 // KeyFingerprint returns the 8-hex-char SHA-256 fingerprint of the active capture secret.
 func (r *Recorder) KeyFingerprint() string {
 	return r.keyFingerprint
+}
+
+// CaptureRunID returns the 32-hex-char public identifier of this Recorder instance.
+func (r *Recorder) CaptureRunID() string {
+	return r.captureRunID
+}
+
+// InFlightRequests returns the current count of in-flight requests tracked in PluginState.
+func (r *Recorder) InFlightRequests() int64 {
+	return r.inFlight.Load()
 }
 
 // RecordedRecords returns the count of events successfully enqueued into the sink.
@@ -372,14 +586,53 @@ func (r *Recorder) Close(ctx context.Context) error {
 	return r.sink.Close(ctx)
 }
 
+type recorderDebugState struct {
+	CaptureRunID    string `json:"captureRunId"`
+	KeyFingerprint  string `json:"keyFingerprint"`
+	BlockSizeTokens int    `json:"blockSizeTokens"`
+	SampleRateBPS   int    `json:"sampleRateBps"`
+	ActiveFile      string `json:"activeFile,omitempty"`
+	InFlight        int64  `json:"inFlight"`
+	RecordsWritten  uint64 `json:"recordsWritten"`
+	RecordsDropped  uint64 `json:"recordsDropped"`
+	WriteErrors     uint64 `json:"writeErrors"`
+	FileRotations   uint64 `json:"fileRotations"`
+}
+
+// DumpState implements plugin.StateDumper with operational counters only.
+// No HMAC key material, session identifiers, or block digests are exposed.
+func (r *Recorder) DumpState() (json.RawMessage, error) {
+	state := recorderDebugState{
+		CaptureRunID:    r.captureRunID,
+		KeyFingerprint:  r.keyFingerprint,
+		BlockSizeTokens: r.blockSize,
+		SampleRateBPS:   r.sampleRateBPS,
+		InFlight:        r.inFlight.Load(),
+		RecordsWritten:  r.recordedCount.Load(),
+		RecordsDropped:  r.droppedCount.Load(),
+	}
+	if sealed, ok := r.sink.(*SealedGzipSink); ok {
+		state.ActiveFile = sealed.ActiveFile()
+		if w := sealed.WrittenRecords(); w > 0 {
+			state.RecordsWritten = w
+		}
+		if d := sealed.Dropped(); d > state.RecordsDropped {
+			state.RecordsDropped = d
+		}
+		state.WriteErrors = sealed.SealErrors()
+		state.FileRotations = sealed.Rotations()
+	}
+	return json.Marshal(state)
+}
+
 // Produces declares no downstream data keys; Recorder acts as a terminal DataProducer observer.
 func (r *Recorder) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{}
 }
 
 // Consumes declares a required dependency on TokenizedRequest (enforcing backend: vllm
-// unless allowEstimateTokenizer is true) and optional dependencies on agent-identity
-// and session-id-producer attributes.
+// unless allowEstimateTokenizer is true) and optional dependencies on agent-identity,
+// session-id-producer, and any attributes referenced by configured session/subagent sources.
 func (r *Recorder) Consumes() plugin.DataDependencies {
 	var consumedTokenized plugin.ConsumedData
 	if !r.cfg.AllowEstimateTokenizer {
@@ -400,14 +653,26 @@ func (r *Recorder) Consumes() plugin.DataDependencies {
 		}
 	}
 
+	optional := map[plugin.DataKey]any{
+		agentidentity.AgentIdentityKey: "",
+		attrsession.SessionIDDataKey.WithNonEmptyProducerName(sessionidconstants.SessionIDProducerType): attrsession.SessionID(""),
+	}
+	mergeOptional := func(deps plugin.DataDependencies) {
+		for k, v := range deps.Optional {
+			if _, exists := optional[k]; !exists {
+				optional[k] = v
+			}
+		}
+	}
+	mergeOptional(sessionaffinity.SourcesConsumes(r.sessionSources))
+	mergeOptional(sessionaffinity.SourcesConsumes(r.parentSessionSources))
+	mergeOptional(sessionaffinity.SourcesConsumes(r.subagentSources))
+
 	return plugin.DataDependencies{
 		Required: map[plugin.DataKey]any{
 			tokenproducer.TokenizedPromptDataKey: consumedTokenized,
 		},
-		Optional: map[plugin.DataKey]any{
-			agentidentity.AgentIdentityKey: "",
-			attrsession.SessionIDDataKey.WithNonEmptyProducerName(sessionidconstants.SessionIDProducerType): attrsession.SessionID(""),
-		},
+		Optional: optional,
 	}
 }
 
@@ -424,8 +689,18 @@ func (r *Recorder) Produce(ctx context.Context, request *scheduling.InferenceReq
 			PluginType, tokenproducer.BackendVLLM, backend)
 	}
 
-	rawSessionKey, sessionSource, rawAgentID, rawSubagentType := resolveSessionAndAgent(request)
-	if !ShouldSample(r.secret, rawSessionKey, r.sampleRateBPS) {
+	rawSessionKey, rawParentSessionID, sessionSource, rawAgentID, rawSubagentType := r.resolveSessionAndSubagent(ctx, request)
+
+	// Key sampling on root session when present so a sampled agent trace retains all subagents.
+	sampleKey := rootSessionPrefix(rawParentSessionID)
+	if sampleKey == "" {
+		sampleKey = rootSessionPrefix(rawSessionKey)
+	}
+	if sampleKey == "" {
+		sampleKey = "req:" + request.RequestID
+	}
+	if !ShouldSample(r.secret, sampleKey, r.sampleRateBPS) {
+		skippedRequestsMetric.WithLabelValues(r.typedName.Name, skipReasonSampledOut).Inc()
 		return nil
 	}
 
@@ -451,9 +726,11 @@ func (r *Recorder) Produce(ctx context.Context, request *scheduling.InferenceReq
 	}
 
 	msgCount, hasSystemPrompt, hasTools := extractStructuralHints(request.Body)
+	maxOut := extractMaxOutputTokens(request.Body)
 
 	rec := &pendingRecord{
 		sessionID:        AnonymizeSessionID(r.secret, rawSessionKey),
+		parentSessionID:  AnonymizeSessionID(r.secret, rawParentSessionID),
 		sessionSource:    sessionSource,
 		cacheSaltID:      AnonymizeCacheSalt(r.secret, rawSalt),
 		agentID:          AnonymizeAgentID(r.secret, rawAgentID),
@@ -462,14 +739,24 @@ func (r *Recorder) Produce(ctx context.Context, request *scheduling.InferenceReq
 		tokenizerBackend: backend,
 		blockSize:        r.blockSize,
 		inTokens:         inTokens,
+		maxOutputTokens:  maxOut,
 		msgCount:         msgCount,
 		hasSystemPrompt:  hasSystemPrompt,
 		hasTools:         hasTools,
 		streaming:        request.Body.Stream,
 		producedAt:       r.clock(),
 		hashIDs:          hashIDs,
+		onEvict: func() {
+			r.inFlight.Add(-1)
+		},
 	}
-	r.pluginState.Write(request.RequestID, plugin.StateKey(r.typedName.String()), rec)
+	stateKey := plugin.StateKey(r.typedName.String())
+	if _, existed := r.pluginState.ReadOrWrite(request.RequestID, stateKey, rec); !existed {
+		r.inFlight.Add(1)
+	} else {
+		r.pluginState.Write(request.RequestID, stateKey, rec)
+	}
+	r.pluginState.BindLiveness(ctx, request.RequestID)
 	return nil
 }
 
@@ -568,10 +855,18 @@ func (r *Recorder) ResponseBody(
 
 	outTokens, outSource := resolveOutputTokens(response)
 
+	usageIn := max(0, response.Usage.PromptTokens)
+	var cachedTokens int
+	if response.Usage.PromptTokenDetails != nil {
+		cachedTokens = max(0, response.Usage.PromptTokenDetails.CachedTokens)
+	}
+
 	ev := Event{
 		Version:          SchemaVersion,
 		KeyFingerprint:   r.keyFingerprint,
+		CaptureRunID:     r.captureRunID,
 		SessionID:        rec.sessionID,
+		ParentSessionID:  rec.parentSessionID,
 		SessionSource:    rec.sessionSource,
 		CacheSaltID:      rec.cacheSaltID,
 		AgentID:          rec.agentID,
@@ -586,8 +881,11 @@ func (r *Recorder) ResponseBody(
 		TokenizerBackend: rec.tokenizerBackend,
 		BlockSize:        rec.blockSize,
 		In:               inTokens,
+		UsageIn:          usageIn,
+		CachedTokens:     cachedTokens,
 		Out:              outTokens,
 		OutSource:        outSource,
+		MaxOutputTokens:  rec.maxOutputTokens,
 		MsgCount:         rec.msgCount,
 		HasSystemPrompt:  rec.hasSystemPrompt,
 		HasTools:         rec.hasTools,
@@ -597,7 +895,13 @@ func (r *Recorder) ResponseBody(
 	if !r.sink.TryEnqueue(ev) {
 		r.droppedCount.Add(1)
 		droppedEventsMetric.WithLabelValues(r.typedName.Name).Inc()
+		if _, isSealed := r.sink.(*SealedGzipSink); !isSealed {
+			droppedRecordsMetric.WithLabelValues(r.typedName.Name, dropReasonBufferFull).Inc()
+		}
 		return
+	}
+	if _, isSealed := r.sink.(*SealedGzipSink); !isSealed {
+		writtenEventsMetric.WithLabelValues(r.typedName.Name).Inc()
 	}
 	r.recordedCount.Add(1)
 }
@@ -693,56 +997,141 @@ func foldFirstBlockCacheSalt(extraFeatures []*kvblock.BlockExtraFeatures, salt s
 	return extraFeatures
 }
 
-func resolveSessionAndAgent(request *scheduling.InferenceRequest) (rawSessionKey, sessionSource, rawAgentID, rawSubagentType string) {
-	rawAgentID = firstHeaderValue(request.Headers, explicitAgentIDHeaders)
+func (r *Recorder) resolveSessionAndSubagent(
+	ctx context.Context,
+	request *scheduling.InferenceRequest,
+) (rawSessionKey, rawParentSessionID, sessionSource, rawAgentID, rawSubagentType string) {
 	rawSubagentType = firstHeaderValue(request.Headers, explicitSubagentTypeHeaders)
+	rawAgentID = stripStreamIndexSuffix(resolveFromSources(ctx, request, r.subagentSources))
+	rawParentSessionID = resolveFromSources(ctx, request, r.parentSessionSources)
 
-	// Priority 1: "header" — agent-identity attribute, session-id-producer attribute,
-	// explicit session/fairness headers, or non-default FairnessID.
-	if v, ok := scheduling.ReadRequestAttribute[string](request, agentidentity.AgentIdentityKey); ok && strings.TrimSpace(v) != "" {
-		rawSessionKey = strings.TrimSpace(v)
-	}
-	if rawSessionKey == "" {
-		if sidVal, ok := attrsession.ReadSessionID(request); ok {
-			if sid := strings.TrimSpace(string(sidVal)); sid != "" {
-				rawSessionKey = sid
-			}
-		}
-	}
-	if rawSessionKey == "" {
-		rawSessionKey = firstHeaderValue(request.Headers, explicitSessionHeaders)
-	}
-	if rawSessionKey == "" {
+	// Priority 1: "header" — configured/default SessionSources (agent-identity attribute,
+	// session-id-producer attribute, explicit session/fairness headers) or non-default FairnessID.
+	rawSessionKey = resolveFromSources(ctx, request, r.sessionSources)
+	if rawSessionKey == "" && r.useDefaultSessionFallback {
 		if fid := strings.TrimSpace(request.FairnessID); fid != "" && fid != reqcommon.DefaultFairnessID {
 			rawSessionKey = fid
 		}
 	}
 	if rawSessionKey != "" {
-		// Support Weka/inference-perf "::sa:<agent_id>:s<idx>" child stream suffixes so
-		// parent and subagent requests share cohort sampling and parent session_id.
-		if parent, saSuffix, hasSA := strings.Cut(rawSessionKey, "::sa:"); hasSA && parent != "" {
-			rawSessionKey = parent
-			if rawAgentID == "" && saSuffix != "" {
-				agentPart, _, _ := strings.Cut(saSuffix, ":")
-				if agentPart != "" {
-					rawAgentID = agentPart
-				} else {
-					rawAgentID = saSuffix
-				}
+		// Support Weka/inference-perf "<parent>::sa:<agent_id>[:s<stream_idx>]" child stream suffixes
+		// so parent and subagent requests share cohort sampling and parent session_id, and parallel
+		// streams of one subagent coalesce via stripStreamIndexSuffix.
+		if parent, agentBase := splitCompositeSubagentSessionID(rawSessionKey); parent != "" {
+			rawSessionKey = rootSessionPrefix(parent)
+			if rawParentSessionID == "" {
+				rawParentSessionID = parent
+			}
+			if rawAgentID == "" && agentBase != "" {
+				rawAgentID = agentBase
 			}
 		}
-		return rawSessionKey, SessionSourceHeader, rawAgentID, rawSubagentType
+		return rawSessionKey, rawParentSessionID, SessionSourceHeader, rawAgentID, rawSubagentType
 	}
 
 	// Priority 2: "prefix_fallback" — digest of CacheSalt + system prompt + Turn-0 user message.
 	var prefixBuf bytes.Buffer
 	if request.Body != nil && request.Body.WriteConversationPrefix(&prefixBuf) {
 		sum := sha256.Sum256(prefixBuf.Bytes())
-		return "pf:" + hex.EncodeToString(sum[:]), SessionSourcePrefixFallback, rawAgentID, rawSubagentType
+		return "pf:" + hex.EncodeToString(sum[:]), rawParentSessionID, SessionSourcePrefixFallback, rawAgentID, rawSubagentType
 	}
 
 	// Priority 3: "request_id" — single-turn fallback.
-	return "req:" + request.RequestID, SessionSourceRequestID, rawAgentID, rawSubagentType
+	return "req:" + request.RequestID, rawParentSessionID, SessionSourceRequestID, rawAgentID, rawSubagentType
+}
+
+func resolveFromSources(
+	ctx context.Context,
+	request *scheduling.InferenceRequest,
+	sources []sessionaffinity.SessionIDSource,
+) string {
+	if request == nil || len(sources) == 0 {
+		return ""
+	}
+	for _, src := range sources {
+		if src.Header != "" {
+			if val := firstHeaderValue(request.Headers, []string{src.Header}); val != "" {
+				return val
+			}
+			continue
+		}
+		if val := strings.TrimSpace(sessionaffinity.ResolveSessionID(ctx, request, []sessionaffinity.SessionIDSource{src})); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+// splitCompositeSubagentSessionID extracts the immediate parent session ID and
+// normalized subagent identifier from "<parent>::sa:<agent_id>[:s<stream_index>]"
+// composite session identifiers emitted by inference-perf WEKA trace replay.
+func splitCompositeSubagentSessionID(sessionID string) (parentID, agentBase string) {
+	idx := strings.LastIndex(sessionID, subagentSessionDelimiter)
+	if idx <= 0 {
+		return "", ""
+	}
+	parent := sessionID[:idx]
+	tail := sessionID[idx+len(subagentSessionDelimiter):]
+	if tail == "" {
+		return "", ""
+	}
+	base := stripStreamIndexSuffix(tail)
+	if base == "" {
+		return "", ""
+	}
+	return parent, base
+}
+
+func stripStreamIndexSuffix(s string) string {
+	idx := strings.LastIndex(s, ":s")
+	if idx <= 0 || idx+2 >= len(s) {
+		return s
+	}
+	for i := idx + 2; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return s
+		}
+	}
+	return s[:idx]
+}
+
+func rootSessionPrefix(sessionID string) string {
+	if idx := strings.Index(sessionID, subagentSessionDelimiter); idx > 0 {
+		return sessionID[:idx]
+	}
+	return sessionID
+}
+
+func extractMaxOutputTokens(body *fwkrequest.InferenceRequestBody) *int64 {
+	if body == nil {
+		return nil
+	}
+	if body.MaxOutputTokens != nil {
+		v := *body.MaxOutputTokens
+		return &v
+	}
+	if body.Payload != nil {
+		if pm, ok := body.Payload.AsMap(); ok {
+			for _, key := range []string{"max_completion_tokens", "max_tokens", "max_output_tokens"} {
+				switch raw := pm[key].(type) {
+				case int:
+					v := int64(raw)
+					return &v
+				case int64:
+					v := raw
+					return &v
+				case float64:
+					v := int64(raw)
+					return &v
+				case json.Number:
+					if parsed, err := raw.Int64(); err == nil {
+						return &parsed
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func firstHeaderValue(headers map[string]string, keys []string) string {

@@ -292,4 +292,45 @@ func TestSealedGzipSink_LocalStagingAndBackpressure(t *testing.T) {
 		evs, _ := readAllGzipEvents(t, filepath.Join(baseDir, "out"))
 		require.Len(t, evs, 8)
 	})
+
+	t.Run("ensureSinkDir_tolerates_permission_error_on_preexisting_dir_and_prunes_maxRotatedFiles", func(t *testing.T) {
+		t.Parallel()
+		baseDir := t.TempDir()
+		existingDir := filepath.Join(baseDir, "k8s-mount")
+		require.NoError(t, os.MkdirAll(existingDir, 0o750))
+
+		// Simulate Kubernetes emptyDir/PVC root-owned mountpoint where Chmod returns os.ErrPermission.
+		err := ensureSinkDir(existingDir, func(_ string, _ os.FileMode) error {
+			return os.ErrPermission
+		})
+		require.NoError(t, err)
+
+		// Verify MaxRotatedFiles pruning retains only the newest N sealed .jsonl.gz files.
+		pruneOut := filepath.Join(baseDir, "prune_out")
+		pruneStage := filepath.Join(baseDir, "prune_stage")
+		clk := newFakeClock(time.UnixMilli(1762121500000))
+		pruneSink, err := NewSealedGzipSink(SealedGzipSinkConfig{
+			OutputDir:       pruneOut,
+			StagingDir:      pruneStage,
+			PodName:         "epp-prune",
+			MaxSegmentBytes: 100, // rotate after every event
+			MaxRotatedFiles: 2,
+			FlushInterval:   time.Hour,
+			BufferSize:      32,
+			Clock:           clk.Now,
+		})
+		require.NoError(t, err)
+
+		for i := range 5 {
+			clk.Advance(10 * time.Millisecond)
+			require.True(t, pruneSink.TryEnqueue(sampleEvent(i)))
+		}
+		require.NoError(t, pruneSink.Close(context.Background()))
+		assert.Equal(t, uint64(5), pruneSink.WrittenRecords())
+		assert.Equal(t, uint64(5), pruneSink.Rotations())
+
+		evs, files := readAllGzipEvents(t, pruneOut)
+		require.Len(t, files, 2, "MaxRotatedFiles=2 must retain only the 2 newest rotated .jsonl.gz files")
+		require.Len(t, evs, 2)
+	})
 }

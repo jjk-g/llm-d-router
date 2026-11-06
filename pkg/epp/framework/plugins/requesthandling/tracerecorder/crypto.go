@@ -120,8 +120,22 @@ func ShouldSample(secret []byte, rawSessionKey string, sampleRateBPS int) bool {
 	return bucket < uint64(sampleRateBPS) // #nosec G115 -- sampleRateBPS is verified > 0 above
 }
 
-// AnonymizeSessionID maps a raw session key to "s_<16-hex>".
+// GenerateCaptureRunID generates an independent 128-bit (32-hex-char) public capture run identifier.
+func GenerateCaptureRunID() (string, error) {
+	var runBytes [16]byte
+	if _, err := rand.Read(runBytes[:]); err != nil {
+		return "", fmt.Errorf("failed to generate capture run id: %w", err)
+	}
+	return hex.EncodeToString(runBytes[:]), nil
+}
+
+// AnonymizeSessionID maps a raw session key to "s_<16-hex>", or returns "" when rawSessionKey is empty.
+// Both SessionID and ParentSessionID share the "session:" domain so child parent_session_id
+// joins directly to parent session_id.
 func AnonymizeSessionID(secret []byte, rawSessionKey string) string {
+	if rawSessionKey == "" {
+		return ""
+	}
 	mac := hmacDomain(secret, "session:", []byte(rawSessionKey))
 	return "s_" + hex.EncodeToString(mac[:8])
 }
@@ -165,6 +179,31 @@ func AnonymizeBlockHash(secret []byte, rawHash uint64) uint64 {
 		return 1
 	}
 	return val
+}
+
+// DownsampleBlockHashes converts prefix-chained digests captured at srcBlockSize
+// to targetBlockSize (an integer multiple k * srcBlockSize) by selecting every
+// k-th chained digest (index (i+1)*k - 1). Trailing blocks that do not fill
+// targetBlockSize are dropped. Supports []uint64, []int64, and []string.
+func DownsampleBlockHashes[T any](hashes []T, srcBlockSize, targetBlockSize int) ([]T, error) {
+	if srcBlockSize <= 0 || targetBlockSize <= 0 {
+		return nil, fmt.Errorf("block sizes must be > 0 (src=%d, target=%d)", srcBlockSize, targetBlockSize)
+	}
+	if targetBlockSize < srcBlockSize || targetBlockSize%srcBlockSize != 0 {
+		return nil, fmt.Errorf("targetBlockSize (%d) must be an integer multiple of srcBlockSize (%d)", targetBlockSize, srcBlockSize)
+	}
+	if targetBlockSize == srcBlockSize {
+		out := make([]T, len(hashes))
+		copy(out, hashes)
+		return out, nil
+	}
+	factor := targetBlockSize / srcBlockSize
+	n := len(hashes) / factor
+	out := make([]T, n)
+	for i := range n {
+		out[i] = hashes[(i+1)*factor-1]
+	}
+	return out, nil
 }
 
 func hmacDomain(secret []byte, domain string, payload []byte) [sha256.Size]byte {

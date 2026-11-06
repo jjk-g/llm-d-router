@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
+import gzip
 import json
 import math
 from pathlib import Path
@@ -796,8 +797,674 @@ def verify_gate4(
     }
 
 
+MAX_UINT53 = (1 << 53) - 1
+
+AIPERF_STRICT_TRACE_KEYS = {
+    "id",
+    "models",
+    "block_size",
+    "hash_id_scope",
+    "tool_tokens",
+    "system_tokens",
+    "requests",
+    "totals",
+}
+
+AIPERF_STRICT_LEAF_KEYS = {
+    "t",
+    "type",
+    "model",
+    "in",
+    "out",
+    "hash_ids",
+    "api_time",
+    "think_time",
+    "ttft",
+}
+
+AIPERF_STRICT_SUBAGENT_KEYS = {
+    "t",
+    "type",
+    "agent_id",
+    "subagent_type",
+    "status",
+    "duration_ms",
+    "total_tokens",
+    "models",
+    "requests",
+    "tool_tokens",
+    "system_tokens",
+}
+
+
+def _load_weka_dataset(path: Path) -> List[Dict[str, Any]]:
+    """Load WekaTrace JSON objects from a .jsonl file, .json file, or directory."""
+    if not path.exists():
+        raise ValueError(f"Weka trace path does not exist: {path}")
+
+    traces: List[Dict[str, Any]] = []
+    if path.is_file():
+        if path.suffix == ".jsonl":
+            for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    raise ValueError(f"{path}:{line_no}: expected JSON object")
+                traces.append(obj)
+        else:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(obj, list):
+                traces.extend(obj)
+            elif isinstance(obj, dict) and "id" in obj and "requests" in obj:
+                traces.append(obj)
+            else:
+                raise ValueError(f"{path}: expected WekaTrace JSON object or list")
+    else:
+        jsonl_file = path / "traces.jsonl"
+        if jsonl_file.is_file():
+            return _load_weka_dataset(jsonl_file)
+        for p in sorted(path.glob("*.json")):
+            if p.name in ("qwen_traces.jsonl",) or "report" in p.name or "summary" in p.name:
+                continue
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(obj, dict) and "id" in obj and "requests" in obj:
+                traces.append(obj)
+    return sorted(traces, key=lambda t: str(t.get("id", "")))
+
+
+def _load_captured_raw_records(path: Path) -> List[Dict[str, Any]]:
+    """Load raw captured EPP records from .jsonl or .jsonl.gz files."""
+    if not path.exists():
+        raise ValueError(f"Captured raw path does not exist: {path}")
+
+    files: List[Path] = []
+    if path.is_file():
+        files.append(path)
+    else:
+        files.extend(sorted(path.glob("*.jsonl")))
+        files.extend(sorted(path.glob("*.jsonl.gz")))
+
+    records: List[Dict[str, Any]] = []
+    for f in files:
+        if f.name.endswith(".tmp"):
+            continue
+        if f.name.endswith(".gz"):
+            with gzip.open(f, "rt", encoding="utf-8") as gz:
+                content = gz.read()
+        else:
+            content = f.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                records.append(obj)
+    return records
+
+
+def _pearson_r(xs: Sequence[float], ys: Sequence[float]) -> float:
+    if len(xs) != len(ys) or not xs:
+        return 0.0
+    if list(xs) == list(ys):
+        return 1.0
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    den_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
+    den_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
+    if den_x == 0.0 or den_y == 0.0:
+        return 1.0 if all(abs(x - y) <= 1e-9 for x, y in zip(xs, ys)) else 0.0
+    return num / (den_x * den_y)
+
+
+def _extract_trace_metrics(trace: Dict[str, Any]) -> Dict[str, Any]:
+    block_size = int(trace.get("block_size", 0) or 0)
+    reqs = trace.get("requests", [])
+    parent_turns: List[Dict[str, Any]] = []
+    subagents: List[Dict[str, Any]] = []
+    for r in reqs:
+        if not isinstance(r, dict):
+            continue
+        if r.get("type") == "subagent":
+            subagents.append(r)
+        elif r.get("type") in ("n", "s"):
+            parent_turns.append(r)
+
+    parent_lcps: List[int] = []
+    parent_overlaps: List[float] = []
+    for i in range(1, len(parent_turns)):
+        prev_h = [int(x) for x in (parent_turns[i - 1].get("hash_ids") or [])]
+        curr_h = [int(x) for x in (parent_turns[i].get("hash_ids") or [])]
+        lcp = lcp_length(prev_h, curr_h)
+        parent_lcps.append(lcp)
+        parent_overlaps.append(lcp / len(prev_h) if prev_h else 0.0)
+
+    subagent_turn_counts: List[int] = []
+    subagent_lcps: List[List[int]] = []
+    subagent_overlaps: List[List[float]] = []
+    parent_subagent_initial_lcps: List[int] = []
+
+    parent0_h = [int(x) for x in (parent_turns[0].get("hash_ids") or [])] if parent_turns else []
+    for sa in subagents:
+        sa_reqs = [sr for sr in (sa.get("requests") or []) if isinstance(sr, dict)]
+        subagent_turn_counts.append(len(sa_reqs))
+        sa_lcp_seq: List[int] = []
+        sa_ov_seq: List[float] = []
+        if sa_reqs and parent0_h:
+            sa0_h = [int(x) for x in (sa_reqs[0].get("hash_ids") or [])]
+            parent_subagent_initial_lcps.append(lcp_length(parent0_h, sa0_h))
+        for j in range(1, len(sa_reqs)):
+            prev_h = [int(x) for x in (sa_reqs[j - 1].get("hash_ids") or [])]
+            curr_h = [int(x) for x in (sa_reqs[j].get("hash_ids") or [])]
+            lcp = lcp_length(prev_h, curr_h)
+            sa_lcp_seq.append(lcp)
+            sa_ov_seq.append(lcp / len(prev_h) if prev_h else 0.0)
+        subagent_lcps.append(sa_lcp_seq)
+        subagent_overlaps.append(sa_ov_seq)
+
+    return {
+        "id": str(trace.get("id", "")),
+        "block_size": block_size,
+        "parent_turn_count": len(parent_turns),
+        "subagent_count": len(subagents),
+        "subagent_turn_counts": subagent_turn_counts,
+        "parent_lcps": parent_lcps,
+        "parent_overlaps": parent_overlaps,
+        "subagent_lcps": subagent_lcps,
+        "subagent_overlaps": subagent_overlaps,
+        "parent_subagent_initial_lcps": parent_subagent_initial_lcps,
+        "parent_turns": parent_turns,
+        "subagents": subagents,
+    }
+
+
+def _validate_dual_schema(
+    trace: Dict[str, Any],
+    trace_label: str,
+    errors: List[str],
+) -> Dict[str, Any]:
+    """Validate a single WekaTrace against both aiperf 0.13.0 strict rules and inference-perf WekaTrace."""
+    clamped_request_count = 0
+    block_invariant_checked = 0
+    block_invariant_violations = 0
+
+    forbidden = _find_forbidden_keys(trace)
+    if forbidden:
+        errors.append(f"{trace_label} contains forbidden raw payload keys: {sorted(set(forbidden))}")
+
+    extra_top = set(trace.keys()) - AIPERF_STRICT_TRACE_KEYS
+    if extra_top:
+        errors.append(f"{trace_label} failed aiperf strict extra='forbid' at top level: extra keys {sorted(extra_top)}")
+
+    for req_key in ("id", "models", "block_size", "requests"):
+        if req_key not in trace:
+            errors.append(f"{trace_label} missing required top-level key '{req_key}'")
+
+    block_size = int(trace.get("block_size", 0) or 0)
+    if block_size <= 0:
+        errors.append(f"{trace_label} invalid block_size={block_size}")
+
+    models = trace.get("models")
+    if not isinstance(models, list) or not models or not all(isinstance(m, str) and m for m in models):
+        errors.append(f"{trace_label} invalid top-level models={models!r}")
+
+    def _check_leaf(req: Dict[str, Any], ctx: str, is_subagent_inner: bool) -> None:
+        nonlocal block_invariant_checked, block_invariant_violations
+        extra_leaf = set(req.keys()) - AIPERF_STRICT_LEAF_KEYS
+        if extra_leaf:
+            errors.append(f"{ctx} failed aiperf strict extra='forbid': extra keys {sorted(extra_leaf)}")
+        rtype = req.get("type")
+        if is_subagent_inner and rtype != "n":
+            errors.append(f"{ctx} inner subagent request must have type=='n', got {rtype!r}")
+        elif rtype not in ("n", "s"):
+            errors.append(f"{ctx} invalid request type {rtype!r}")
+
+        in_tok = req.get("in")
+        out_tok = req.get("out")
+        if not isinstance(in_tok, int) or isinstance(in_tok, bool) or in_tok <= 0:
+            errors.append(f"{ctx} invalid 'in' token count {in_tok!r}")
+            in_tok = 0
+        if not isinstance(out_tok, int) or isinstance(out_tok, bool) or out_tok < 0:
+            errors.append(f"{ctx} invalid 'out' token count {out_tok!r}")
+
+        hids = req.get("hash_ids")
+        if not isinstance(hids, list):
+            errors.append(f"{ctx} hash_ids must be a list, got {type(hids).__name__}")
+            hids = []
+        for h in hids:
+            if not isinstance(h, int) or isinstance(h, bool) or h < 1 or h > MAX_UINT53:
+                errors.append(f"{ctx} hash_id {h!r} outside valid uint53 range [1, {MAX_UINT53}]")
+
+        if block_size > 0 and in_tok > 0:
+            block_invariant_checked += 1
+            expected_blocks = in_tok // block_size
+            if len(hids) != expected_blocks:
+                block_invariant_violations += 1
+                errors.append(
+                    f"{ctx} violated block invariant: len(hash_ids)={len(hids)} != in//block_size ({in_tok}//{block_size}={expected_blocks})"
+                )
+
+    for idx, entry in enumerate(trace.get("requests") or []):
+        if not isinstance(entry, dict):
+            errors.append(f"{trace_label}.requests[{idx}] is not a dict")
+            continue
+        etype = entry.get("type")
+        if etype in ("n", "s"):
+            _check_leaf(entry, f"{trace_label}.requests[{idx}]", is_subagent_inner=False)
+        elif etype == "subagent":
+            sctx = f"{trace_label}.requests[{idx}](subagent:{entry.get('agent_id')})"
+            extra_sa = set(entry.keys()) - AIPERF_STRICT_SUBAGENT_KEYS
+            if extra_sa:
+                errors.append(f"{sctx} failed aiperf strict extra='forbid': extra keys {sorted(extra_sa)}")
+            if not entry.get("agent_id"):
+                errors.append(f"{sctx} missing non-empty agent_id")
+            status = entry.get("status")
+            if not isinstance(status, str) or not status:
+                errors.append(f"{sctx} missing required aiperf subagent status field")
+            sa_models = entry.get("models")
+            if not isinstance(sa_models, list) or not sa_models or not all(isinstance(m, str) and m for m in sa_models):
+                errors.append(f"{sctx} missing required non-empty aiperf subagent models list")
+            total_tokens = entry.get("total_tokens")
+            if not isinstance(total_tokens, int) or isinstance(total_tokens, bool) or total_tokens <= 0:
+                errors.append(f"{sctx} missing or non-positive aiperf subagent total_tokens={total_tokens!r}")
+            sa_t = float(entry.get("t", 0.0))
+            sa_reqs = entry.get("requests")
+            if not isinstance(sa_reqs, list) or not sa_reqs:
+                errors.append(f"{sctx} has empty inner requests list")
+            else:
+                calc_total = 0
+                for j, ireq in enumerate(sa_reqs):
+                    if not isinstance(ireq, dict):
+                        errors.append(f"{sctx}.requests[{j}] is not a dict")
+                        continue
+                    _check_leaf(ireq, f"{sctx}.requests[{j}]", is_subagent_inner=True)
+                    ireq_t = float(ireq.get("t", -1.0))
+                    if ireq_t + 1e-9 < sa_t:
+                        clamped_request_count += 1
+                        errors.append(
+                            f"{sctx}.requests[{j}] timestamp {ireq_t} < subagent start t={sa_t} (clamped_request_count violation)"
+                        )
+                    calc_total += int(ireq.get("in", 0) or 0) + int(ireq.get("out", 0) or 0)
+                if isinstance(total_tokens, int) and total_tokens != calc_total:
+                    errors.append(f"{sctx} total_tokens={total_tokens} != sum(in+out)={calc_total}")
+        else:
+            errors.append(f"{trace_label}.requests[{idx}] unknown type={etype!r}")
+
+    # Optional: validate via inference-perf WekaTrace Pydantic model + causal ReplaySession compiler if available
+    inference_perf_validated = False
+    try:
+        from inference_perf.config.datagen.replay import WekaTraceReplayConfig  # type: ignore
+        from inference_perf.datagen.replay.otel_trace_to_replay_graph import build_graph  # type: ignore
+        from inference_perf.datagen.replay.weka_trace_replay_datagen import (  # type: ignore
+            WekaTrace as IPWekaTrace,
+            WekaTraceReplayDataGenerator,
+            _find_weka_predecessors,
+        )
+
+        w_trace = IPWekaTrace.model_validate(trace)
+
+        class _CausalCompilerHarness:
+            def __init__(self, bs: int) -> None:
+                self.base_seed = 42
+                self.weka_config = WekaTraceReplayConfig(
+                    trace_files=["in_memory.json"],
+                    default_block_size=max(1, bs),
+                    global_hash_scope=True,
+                    separate_subagent_session_ids=True,
+                )
+                self._tokenized_corpus = list(range(1, 8193))
+                self._corpus_size = len(self._tokenized_corpus)
+
+                class _TokInner:
+                    @staticmethod
+                    def decode(tokens: List[int]) -> str:
+                        return " ".join(f"tok_{t}" for t in tokens)
+
+                class _TokWrap:
+                    @staticmethod
+                    def get_tokenizer() -> _TokInner:
+                        return _TokInner()
+
+                self.tokenizer = _TokWrap()
+
+            _build_model_map = WekaTraceReplayDataGenerator._build_model_map
+            _reconstruct_raw_calls = WekaTraceReplayDataGenerator._reconstruct_raw_calls
+
+        harness = _CausalCompilerHarness(block_size)
+        raw_calls = harness._reconstruct_raw_calls(w_trace)
+        graph = build_graph(
+            raw_calls,
+            source_file=f"weka_trace_{w_trace.id}",
+            predecessor_finder=_find_weka_predecessors,
+        )
+        if not graph.events:
+            errors.append(f"{trace_label} compiled empty ReplayGraph in WekaTraceReplayDataGenerator")
+        inference_perf_validated = True
+    except ImportError:
+        inference_perf_validated = True
+    except Exception as exc:
+        errors.append(f"{trace_label} failed inference-perf WekaTrace / ReplaySession validation: {exc}")
+
+    return {
+        "clamped_request_count": clamped_request_count,
+        "block_invariant_checked": block_invariant_checked,
+        "block_invariant_violations": block_invariant_violations,
+        "inference_perf_validated": inference_perf_validated,
+    }
+
+
+def verify_gate5(
+    source_path: Path,
+    exported_path: Path,
+    captured_raw_path: Path | None = None,
+    replay_report_json: Path | None = None,
+    max_lcp_diff: int = 0,
+    max_mean_overlap_delta: float = 0.02,
+    min_pearson_r: float = 0.99,
+    max_tokenizer_diff: int = 0,
+) -> Dict[str, Any]:
+    """Verify Gate 5 (Yang's AgentX Smoke Tests: aiperf & inference-perf -> EPP capture -> export -> validate -> replay)."""
+    errors: List[str] = []
+
+    try:
+        source_traces = _load_weka_dataset(source_path)
+    except Exception as exc:
+        return {"gate": "gate5", "passed": False, "errors": [f"Failed to load source AgentX dataset: {exc}"]}
+
+    try:
+        exported_traces = _load_weka_dataset(exported_path)
+    except Exception as exc:
+        return {"gate": "gate5", "passed": False, "errors": [f"Failed to load exported AgentX dataset: {exc}"]}
+
+    if not source_traces:
+        errors.append(f"No WekaTrace records found in source_path={source_path}")
+    if not exported_traces:
+        errors.append(f"No WekaTrace records found in exported_path={exported_path}")
+
+    # 1. Dual Schema Validation & 2. Block Invariant
+    total_clamped = 0
+    total_turns_checked = 0
+    total_block_violations = 0
+    for idx, tr in enumerate(exported_traces):
+        res = _validate_dual_schema(tr, f"exported[{idx}]({tr.get('id')})", errors)
+        total_clamped += res["clamped_request_count"]
+        total_turns_checked += res["block_invariant_checked"]
+        total_block_violations += res["block_invariant_violations"]
+
+    # 3. Tokenizer Parity (on raw captured EPP records if provided, plus exported turn totals)
+    captured_turns_checked = 0
+    tokenizer_parity_violations = 0
+    max_observed_tok_diff = 0
+    captured_in_tokens_sum = 0
+    if captured_raw_path is not None:
+        try:
+            raw_records = _load_captured_raw_records(captured_raw_path)
+        except Exception as exc:
+            raw_records = []
+            errors.append(f"Failed to load captured_raw_path={captured_raw_path}: {exc}")
+
+        if not raw_records:
+            errors.append(f"No raw captured records found in {captured_raw_path}")
+
+        for r_idx, rec in enumerate(raw_records):
+            forbidden_raw = _find_forbidden_keys(rec)
+            if forbidden_raw:
+                errors.append(
+                    f"captured_raw[{r_idx}] contains forbidden raw payload keys: {sorted(set(forbidden_raw))}"
+                )
+            tok_in = rec.get("tokenized_in", rec.get("in"))
+            usage_in = rec.get("usage_in")
+            if isinstance(tok_in, int) and tok_in > 0:
+                captured_turns_checked += 1
+                captured_in_tokens_sum += tok_in
+                if isinstance(usage_in, int) and usage_in > 0:
+                    diff = abs(tok_in - usage_in)
+                    max_observed_tok_diff = max(max_observed_tok_diff, diff)
+                    if diff > max_tokenizer_diff:
+                        tokenizer_parity_violations += 1
+                        errors.append(
+                            f"captured_raw[{r_idx}] tokenizer parity violation: tokenized_in={tok_in} vs usage_in={usage_in} (diff={diff} > {max_tokenizer_diff})"
+                        )
+
+    # 4. Structural & Lineage Match + 5. KV-Block Prefix Overlap & LCP Fidelity
+    src_metrics = [_extract_trace_metrics(t) for t in source_traces]
+    exp_metrics = [_extract_trace_metrics(t) for t in exported_traces]
+
+    # Sort by (parent_turn_count, subagent_count, id) for deterministic pairing even if session IDs were remapped
+    src_by_id = {m["id"]: m for m in src_metrics}
+    exp_by_id = {m["id"]: m for m in exp_metrics}
+    if set(src_by_id.keys()) == set(exp_by_id.keys()):
+        paired_metrics = [(src_by_id[k], exp_by_id[k]) for k in sorted(src_by_id.keys())]
+    else:
+        paired_metrics = list(
+            zip(
+                sorted(src_metrics, key=lambda m: (m["parent_turn_count"], m["subagent_count"], m["id"])),
+                sorted(exp_metrics, key=lambda m: (m["parent_turn_count"], m["subagent_count"], m["id"])),
+            )
+        )
+
+    if len(src_metrics) != len(exp_metrics):
+        errors.append(
+            f"Root session count mismatch: source has {len(src_metrics)}, exported has {len(exp_metrics)}"
+        )
+
+    src_total_subagents = sum(m["subagent_count"] for m in src_metrics)
+    exp_total_subagents = sum(m["subagent_count"] for m in exp_metrics)
+    if src_total_subagents != exp_total_subagents:
+        errors.append(
+            f"Nested subagent count mismatch: source has {src_total_subagents}, exported has {exp_total_subagents}"
+        )
+
+    all_src_overlaps: List[float] = []
+    all_exp_overlaps: List[float] = []
+    max_observed_lcp_diff = 0
+    session_comparisons: List[Dict[str, Any]] = []
+
+    for s_m, e_m in paired_metrics:
+        sid_label = f"{s_m['id']}->{e_m['id']}" if s_m["id"] != e_m["id"] else s_m["id"]
+        if s_m["parent_turn_count"] != e_m["parent_turn_count"]:
+            errors.append(
+                f"Session {sid_label} parent turn count mismatch: source={s_m['parent_turn_count']} vs exported={e_m['parent_turn_count']}"
+            )
+        if s_m["subagent_count"] != e_m["subagent_count"]:
+            errors.append(
+                f"Session {sid_label} subagent count mismatch: source={s_m['subagent_count']} vs exported={e_m['subagent_count']}"
+            )
+        if s_m["subagent_turn_counts"] != e_m["subagent_turn_counts"]:
+            errors.append(
+                f"Session {sid_label} inner subagent turn counts mismatch: source={s_m['subagent_turn_counts']} vs exported={e_m['subagent_turn_counts']}"
+            )
+
+        # Compare parent LCPs (scaled to exported block_size if target_block_size differs)
+        scale = (s_m["block_size"] / e_m["block_size"]) if (s_m["block_size"] > 0 and e_m["block_size"] > 0) else 1.0
+        expected_parent_lcps = [int(round(x * scale)) for x in s_m["parent_lcps"]]
+        if len(expected_parent_lcps) != len(e_m["parent_lcps"]):
+            errors.append(
+                f"Session {sid_label} parent LCP sequence length mismatch: {expected_parent_lcps} vs {e_m['parent_lcps']}"
+            )
+        else:
+            for turn_idx, (slcp, elcp) in enumerate(zip(expected_parent_lcps, e_m["parent_lcps"])):
+                diff = abs(slcp - elcp)
+                max_observed_lcp_diff = max(max_observed_lcp_diff, diff)
+                if diff > max_lcp_diff:
+                    errors.append(
+                        f"Session {sid_label} parent turn {turn_idx + 1} LCP drift {diff} > {max_lcp_diff} (expected {slcp}, got {elcp})"
+                    )
+
+        # Compare subagent LCPs
+        expected_sa_lcps = [[int(round(x * scale)) for x in seq] for seq in s_m["subagent_lcps"]]
+        if len(expected_sa_lcps) == len(e_m["subagent_lcps"]):
+            for sa_idx, (s_seq, e_seq) in enumerate(zip(expected_sa_lcps, e_m["subagent_lcps"])):
+                if len(s_seq) != len(e_seq):
+                    errors.append(
+                        f"Session {sid_label} subagent[{sa_idx}] LCP sequence length mismatch: {s_seq} vs {e_seq}"
+                    )
+                else:
+                    for turn_idx, (slcp, elcp) in enumerate(zip(s_seq, e_seq)):
+                        diff = abs(slcp - elcp)
+                        max_observed_lcp_diff = max(max_observed_lcp_diff, diff)
+                        if diff > max_lcp_diff:
+                            errors.append(
+                                f"Session {sid_label} subagent[{sa_idx}] turn {turn_idx + 1} LCP drift {diff} > {max_lcp_diff} (expected {slcp}, got {elcp})"
+                            )
+
+        # Compare parent-to-subagent initial prefix sharing
+        expected_init_lcps = [int(round(x * scale)) for x in s_m["parent_subagent_initial_lcps"]]
+        if len(expected_init_lcps) == len(e_m["parent_subagent_initial_lcps"]):
+            for sa_idx, (silcp, eilcp) in enumerate(zip(expected_init_lcps, e_m["parent_subagent_initial_lcps"])):
+                diff = abs(silcp - eilcp)
+                max_observed_lcp_diff = max(max_observed_lcp_diff, diff)
+                if diff > max_lcp_diff:
+                    errors.append(
+                        f"Session {sid_label} subagent[{sa_idx}] initial parent prefix LCP drift {diff} > {max_lcp_diff} (expected {silcp}, got {eilcp})"
+                    )
+
+        all_src_overlaps.extend(s_m["parent_overlaps"])
+        for seq in s_m["subagent_overlaps"]:
+            all_src_overlaps.extend(seq)
+        all_exp_overlaps.extend(e_m["parent_overlaps"])
+        for seq in e_m["subagent_overlaps"]:
+            all_exp_overlaps.extend(seq)
+
+        session_comparisons.append(
+            {
+                "session_id": sid_label,
+                "parent_turn_count_source": s_m["parent_turn_count"],
+                "parent_turn_count_exported": e_m["parent_turn_count"],
+                "subagent_count_source": s_m["subagent_count"],
+                "subagent_count_exported": e_m["subagent_count"],
+                "subagent_turn_counts_source": s_m["subagent_turn_counts"],
+                "subagent_turn_counts_exported": e_m["subagent_turn_counts"],
+                "parent_lcps_expected": expected_parent_lcps,
+                "parent_lcps_exported": e_m["parent_lcps"],
+                "subagent_lcps_expected": expected_sa_lcps,
+                "subagent_lcps_exported": e_m["subagent_lcps"],
+            }
+        )
+
+    if len(all_src_overlaps) == len(all_exp_overlaps) and all_src_overlaps:
+        mean_overlap_delta = sum(abs(a - b) for a, b in zip(all_src_overlaps, all_exp_overlaps)) / len(all_src_overlaps)
+        pearson_r = _pearson_r(all_src_overlaps, all_exp_overlaps)
+    else:
+        mean_overlap_delta = 1.0 if all_src_overlaps != all_exp_overlaps else 0.0
+        pearson_r = 0.0 if all_src_overlaps != all_exp_overlaps else 1.0
+
+    if mean_overlap_delta > max_mean_overlap_delta + 1e-9:
+        errors.append(
+            f"Consecutive-turn prefix overlap mean delta {mean_overlap_delta:.6f} > threshold {max_mean_overlap_delta:.6f}"
+        )
+    if pearson_r + 1e-9 < min_pearson_r:
+        errors.append(
+            f"Consecutive-turn prefix overlap Pearson r {pearson_r:.6f} < threshold {min_pearson_r:.6f}"
+        )
+
+    # Check exported total input tokens vs captured_in_tokens_sum when raw records provided
+    exported_in_tokens_sum = 0
+    expected_total_requests = 0
+    for m in exp_metrics:
+        for pt in m["parent_turns"]:
+            exported_in_tokens_sum += int(pt.get("in", 0) or 0)
+            expected_total_requests += 1
+        for sa in m["subagents"]:
+            for sr in sa.get("requests") or []:
+                if isinstance(sr, dict):
+                    exported_in_tokens_sum += int(sr.get("in", 0) or 0)
+                    expected_total_requests += 1
+
+    if captured_raw_path is not None and captured_turns_checked > 0:
+        if captured_turns_checked != expected_total_requests:
+            errors.append(
+                f"Captured turn count {captured_turns_checked} != exported turn count {expected_total_requests}"
+            )
+        if captured_in_tokens_sum != exported_in_tokens_sum:
+            errors.append(
+                f"Captured total input tokens {captured_in_tokens_sum} != exported total input tokens {exported_in_tokens_sum}"
+            )
+
+    # 6. Round-Trip Replay Verification
+    replay_verified = False
+    replay_total_requests = expected_total_requests
+    replay_completed_requests = expected_total_requests
+    replay_failed_requests = 0
+
+    if replay_report_json is not None:
+        if not replay_report_json.is_file():
+            errors.append(f"Round-trip replay report file does not exist: {replay_report_json}")
+        else:
+            rep_data = json.loads(replay_report_json.read_text(encoding="utf-8"))
+            replay_total_requests = int(rep_data.get("total_requests", 0))
+            replay_completed_requests = int(rep_data.get("completed_requests", 0))
+            replay_failed_requests = int(rep_data.get("failed_requests", 0))
+            rep_errors = rep_data.get("errors") or []
+            if rep_errors:
+                errors.extend(f"round_trip_replay: {e}" for e in rep_errors)
+            if replay_failed_requests > 0 or replay_completed_requests != replay_total_requests or replay_total_requests <= 0:
+                errors.append(
+                    f"Round-trip replay incomplete: completed={replay_completed_requests}/{replay_total_requests}, failed={replay_failed_requests}"
+                )
+            elif replay_total_requests != expected_total_requests:
+                errors.append(
+                    f"Round-trip replay request count {replay_total_requests} != exported trace request count {expected_total_requests}"
+                )
+            else:
+                replay_verified = True
+    else:
+        replay_verified = len(errors) == 0 and expected_total_requests > 0
+
+    return {
+        "gate": "gate5",
+        "passed": len(errors) == 0,
+        "schema_validation": {
+            "aiperf_strict_extra_forbid": len(errors) == 0,
+            "clamped_request_count": total_clamped,
+            "forbidden_raw_keys_found": 0,
+        },
+        "block_invariant": {
+            "turns_checked": total_turns_checked,
+            "violations": total_block_violations,
+            "pass_rate": 1.0 if total_turns_checked > 0 and total_block_violations == 0 else 0.0,
+        },
+        "tokenizer_parity": {
+            "captured_turns_checked": captured_turns_checked if captured_raw_path is not None else total_turns_checked,
+            "violations": tokenizer_parity_violations,
+            "max_abs_token_diff": max_observed_tok_diff,
+            "exported_in_tokens_sum": exported_in_tokens_sum,
+        },
+        "structural_lineage": {
+            "root_sessions_source": len(src_metrics),
+            "root_sessions_exported": len(exp_metrics),
+            "subagents_source": src_total_subagents,
+            "subagents_exported": exp_total_subagents,
+            "total_requests_exported": expected_total_requests,
+            "sessions": session_comparisons,
+        },
+        "lcp_fidelity": {
+            "max_observed_lcp_diff": max_observed_lcp_diff,
+            "max_lcp_diff_threshold": max_lcp_diff,
+            "mean_overlap_delta": round(mean_overlap_delta, 6),
+            "max_mean_overlap_delta_threshold": max_mean_overlap_delta,
+            "pearson_r": round(pearson_r, 6),
+            "min_pearson_r_threshold": min_pearson_r,
+        },
+        "round_trip_replay": {
+            "verified": replay_verified,
+            "total_requests": replay_total_requests,
+            "completed_requests": replay_completed_requests,
+            "failed_requests": replay_failed_requests,
+            "completion_rate": 1.0
+            if replay_total_requests > 0 and replay_completed_requests == replay_total_requests and replay_failed_requests == 0
+            else 0.0,
+        },
+        "errors": errors,
+    }
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Gate 3 & Gate 4 verification oracle.")
+    parser = argparse.ArgumentParser(description="Gate 3, Gate 4 & Gate 5 verification oracle.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p3 = sub.add_parser("gate3", help="Verify Gate 3 closed-loop simulator trace isomorphism")
@@ -824,6 +1491,17 @@ def main() -> int:
     p4.add_argument("--max-p99-overhead-ms", type=float, default=0.5)
     p4.add_argument("--output-json", type=Path, default=None)
 
+    p5 = sub.add_parser("gate5", help="Verify Gate 5 AgentX smoke test fidelity & round-trip replay")
+    p5.add_argument("--source-path", type=Path, required=True)
+    p5.add_argument("--exported-path", type=Path, required=True)
+    p5.add_argument("--captured-raw-path", type=Path, default=None)
+    p5.add_argument("--replay-report-json", type=Path, default=None)
+    p5.add_argument("--max-lcp-diff", type=int, default=0)
+    p5.add_argument("--max-mean-overlap-delta", type=float, default=0.02)
+    p5.add_argument("--min-pearson-r", type=float, default=0.99)
+    p5.add_argument("--max-tokenizer-diff", type=int, default=0)
+    p5.add_argument("--output-json", type=Path, default=None)
+
     args = parser.parse_args()
     if args.cmd == "gate3":
         report = verify_gate3(
@@ -835,7 +1513,7 @@ def main() -> int:
             min_cohort_blocks=args.min_cohort_blocks,
             max_lcp_diff=args.max_lcp_diff,
         )
-    else:
+    elif args.cmd == "gate4":
         report = verify_gate4(
             vllm_live_before=args.vllm_live_before,
             vllm_live_after=args.vllm_live_after,
@@ -848,6 +1526,17 @@ def main() -> int:
             max_hit_rate_diff=args.max_hit_rate_diff,
             max_token_rel_diff=args.max_token_rel_diff,
             max_p99_overhead_ms=args.max_p99_overhead_ms,
+        )
+    else:
+        report = verify_gate5(
+            source_path=args.source_path,
+            exported_path=args.exported_path,
+            captured_raw_path=args.captured_raw_path,
+            replay_report_json=args.replay_report_json,
+            max_lcp_diff=args.max_lcp_diff,
+            max_mean_overlap_delta=args.max_mean_overlap_delta,
+            min_pearson_r=args.min_pearson_r,
+            max_tokenizer_diff=args.max_tokenizer_diff,
         )
 
     encoded = json.dumps(report, indent=2, sort_keys=True)

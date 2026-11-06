@@ -40,6 +40,9 @@ const (
 
 	// DefaultFlushInterval is the default max age of an open staging segment before sealing.
 	DefaultFlushInterval = 30 * time.Second
+
+	sinkDirPerm  = 0o750
+	sinkFilePerm = 0o600
 )
 
 // TraceSink consumes anonymized trace events off the request hot path.
@@ -117,7 +120,9 @@ type SealedGzipSinkConfig struct {
 	OutputDir       string
 	StagingDir      string
 	PodName         string
+	PluginName      string
 	MaxSegmentBytes int64
+	MaxRotatedFiles int
 	FlushInterval   time.Duration
 	BufferSize      int
 	Clock           func() time.Time
@@ -133,8 +138,12 @@ type SealedGzipSinkConfig struct {
 type SealedGzipSink struct {
 	outputDir       string
 	stagingDir      string
+	outputRoot      *os.Root
+	stagingRoot     *os.Root
 	podName         string
+	pluginName      string
 	maxSegmentBytes int64
+	maxRotatedFiles int
 	flushInterval   time.Duration
 	clock           func() time.Time
 	blockConsumerCh <-chan struct{}
@@ -146,33 +155,53 @@ type SealedGzipSink struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 
-	dropped  atomic.Uint64
-	sealErrs atomic.Uint64
+	writtenRecords atomic.Uint64
+	dropped        atomic.Uint64
+	sealErrs       atomic.Uint64
+	rotations      atomic.Uint64
+	activeName     atomic.Value // string
 
 	// Writer-goroutine-owned state:
 	seq               uint64
 	activeFile        *os.File
 	activeGzip        *gzip.Writer
 	activePath        string
+	activeStagingName string
 	activeOpenedAt    time.Time
 	activeUncompBytes int64
+	rotatedFiles      []string
 	lastErr           error
 }
 
 // NewSealedGzipSink creates staging and output directories and starts the background writer goroutine.
 func NewSealedGzipSink(cfg SealedGzipSinkConfig) (*SealedGzipSink, error) {
-	if strings.TrimSpace(cfg.OutputDir) == "" {
+	outputDir := strings.TrimSpace(cfg.OutputDir)
+	if outputDir == "" {
 		return nil, errors.New("SealedGzipSink: outputDir is required")
 	}
+	outputDir = filepath.Clean(outputDir)
+
 	stagingDir := strings.TrimSpace(cfg.StagingDir)
 	if stagingDir == "" {
 		stagingDir = filepath.Join(os.TempDir(), "epp-traces-staging")
 	}
-	if err := os.MkdirAll(stagingDir, 0o750); err != nil {
-		return nil, fmt.Errorf("SealedGzipSink: failed to create stagingDir %q: %w", stagingDir, err)
+	stagingDir = filepath.Clean(stagingDir)
+
+	if err := ensureSinkDir(stagingDir, os.Chmod); err != nil {
+		return nil, fmt.Errorf("SealedGzipSink: failed to prepare stagingDir %q: %w", stagingDir, err)
 	}
-	if err := os.MkdirAll(cfg.OutputDir, 0o750); err != nil {
-		return nil, fmt.Errorf("SealedGzipSink: failed to create outputDir %q: %w", cfg.OutputDir, err)
+	if err := ensureSinkDir(outputDir, os.Chmod); err != nil {
+		return nil, fmt.Errorf("SealedGzipSink: failed to prepare outputDir %q: %w", outputDir, err)
+	}
+
+	stagingRoot, err := os.OpenRoot(stagingDir)
+	if err != nil {
+		return nil, fmt.Errorf("SealedGzipSink: failed to open stagingDir root %q: %w", stagingDir, err)
+	}
+	outputRoot, err := os.OpenRoot(outputDir)
+	if err != nil {
+		_ = stagingRoot.Close()
+		return nil, fmt.Errorf("SealedGzipSink: failed to open outputDir root %q: %w", outputDir, err)
 	}
 
 	podName := sanitizePodName(cfg.PodName)
@@ -184,6 +213,11 @@ func NewSealedGzipSink(cfg SealedGzipSinkConfig) (*SealedGzipSink, error) {
 	}
 	if podName == "" {
 		podName = "epp"
+	}
+
+	pluginName := strings.TrimSpace(cfg.PluginName)
+	if pluginName == "" {
+		pluginName = PluginType
 	}
 
 	maxBytes := cfg.MaxSegmentBytes
@@ -203,11 +237,17 @@ func NewSealedGzipSink(cfg SealedGzipSinkConfig) (*SealedGzipSink, error) {
 		clock = time.Now
 	}
 
+	registerRecorderMetrics()
+
 	s := &SealedGzipSink{
-		outputDir:       cfg.OutputDir,
+		outputDir:       outputDir,
 		stagingDir:      stagingDir,
+		outputRoot:      outputRoot,
+		stagingRoot:     stagingRoot,
 		podName:         podName,
+		pluginName:      pluginName,
 		maxSegmentBytes: maxBytes,
+		maxRotatedFiles: max(0, cfg.MaxRotatedFiles),
 		flushInterval:   flushInterval,
 		clock:           clock,
 		blockConsumerCh: cfg.BlockConsumerCh,
@@ -220,6 +260,23 @@ func NewSealedGzipSink(cfg SealedGzipSinkConfig) (*SealedGzipSink, error) {
 	return s, nil
 }
 
+func ensureSinkDir(cleanDir string, chmodFn func(string, os.FileMode) error) error {
+	info, statErr := os.Stat(cleanDir)
+	preExisting := statErr == nil && info.IsDir()
+	if err := os.MkdirAll(cleanDir, sinkDirPerm); err != nil {
+		return err
+	}
+	if err := chmodFn(cleanDir, sinkDirPerm); err != nil {
+		// Pre-existing volume mountpoints (e.g. Kubernetes emptyDir/PVC with fsGroup)
+		// are owned by root while writable by the container GID; POSIX forbids non-owner chmod.
+		if preExisting && errors.Is(err, os.ErrPermission) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // TryEnqueue enqueues ev without blocking. If the ring/channel buffer is full or
 // the sink is closed, it increments the dropped counter and returns false immediately.
 func (s *SealedGzipSink) TryEnqueue(ev Event) bool {
@@ -227,6 +284,7 @@ func (s *SealedGzipSink) TryEnqueue(ev Event) bool {
 	defer s.enqueueMu.RUnlock()
 	if s.closed {
 		s.dropped.Add(1)
+		droppedRecordsMetric.WithLabelValues(s.pluginName, dropReasonSinkClosed).Inc()
 		return false
 	}
 	select {
@@ -234,6 +292,7 @@ func (s *SealedGzipSink) TryEnqueue(ev Event) bool {
 		return true
 	default:
 		s.dropped.Add(1)
+		droppedRecordsMetric.WithLabelValues(s.pluginName, dropReasonBufferFull).Inc()
 		return false
 	}
 }
@@ -285,13 +344,37 @@ func (s *SealedGzipSink) Dropped() uint64 {
 	return s.dropped.Load()
 }
 
-// SealErrors returns the total count of segment seal errors encountered.
+// WrittenRecords returns the total count of events written to segment files.
+func (s *SealedGzipSink) WrittenRecords() uint64 {
+	return s.writtenRecords.Load()
+}
+
+// SealErrors returns the total count of segment seal or write errors encountered.
 func (s *SealedGzipSink) SealErrors() uint64 {
 	return s.sealErrs.Load()
 }
 
+// Rotations returns the total count of sealed segment files produced.
+func (s *SealedGzipSink) Rotations() uint64 {
+	return s.rotations.Load()
+}
+
+// ActiveFile returns the basename of the current staging or last sealed segment file.
+func (s *SealedGzipSink) ActiveFile() string {
+	v, _ := s.activeName.Load().(string)
+	return v
+}
+
 func (s *SealedGzipSink) writerLoop() {
-	defer close(s.doneCh)
+	defer func() {
+		if s.stagingRoot != nil {
+			_ = s.stagingRoot.Close()
+		}
+		if s.outputRoot != nil {
+			_ = s.outputRoot.Close()
+		}
+		close(s.doneCh)
+	}()
 
 	if s.blockConsumerCh != nil {
 		select {
@@ -311,8 +394,7 @@ func (s *SealedGzipSink) writerLoop() {
 		select {
 		case ev := <-s.queue:
 			if err := s.writeEvent(ev); err != nil {
-				s.lastErr = err
-				s.sealErrs.Add(1)
+				s.recordWriteError(err)
 			}
 		case reply := <-s.flushReq:
 			s.drainAvailable()
@@ -320,24 +402,21 @@ func (s *SealedGzipSink) writerLoop() {
 			if s.activeFile != nil && s.clock().Sub(s.activeOpenedAt) >= s.flushInterval {
 				err = s.sealActiveSegment()
 				if err != nil {
-					s.lastErr = err
-					s.sealErrs.Add(1)
+					s.recordWriteError(err)
 				}
 			}
 			reply <- err
 		case <-ticker.C:
 			if s.activeFile != nil && s.clock().Sub(s.activeOpenedAt) >= s.flushInterval {
 				if err := s.sealActiveSegment(); err != nil {
-					s.lastErr = err
-					s.sealErrs.Add(1)
+					s.recordWriteError(err)
 				}
 			}
 		case <-s.stopCh:
 			s.drainAvailable()
 			if s.activeFile != nil {
 				if err := s.sealActiveSegment(); err != nil {
-					s.lastErr = err
-					s.sealErrs.Add(1)
+					s.recordWriteError(err)
 				}
 			}
 			return
@@ -345,13 +424,18 @@ func (s *SealedGzipSink) writerLoop() {
 	}
 }
 
+func (s *SealedGzipSink) recordWriteError(err error) {
+	s.lastErr = err
+	s.sealErrs.Add(1)
+	droppedRecordsMetric.WithLabelValues(s.pluginName, dropReasonWriteError).Inc()
+}
+
 func (s *SealedGzipSink) drainAvailable() {
 	for {
 		select {
 		case ev := <-s.queue:
 			if err := s.writeEvent(ev); err != nil {
-				s.lastErr = err
-				s.sealErrs.Add(1)
+				s.recordWriteError(err)
 			}
 		default:
 			return
@@ -380,6 +464,8 @@ func (s *SealedGzipSink) writeEvent(ev Event) error {
 		return fmt.Errorf("failed to write gzip trace event: %w", err)
 	}
 	s.activeUncompBytes += int64(n)
+	s.writtenRecords.Add(1)
+	writtenEventsMetric.WithLabelValues(s.pluginName).Inc()
 
 	if s.activeUncompBytes >= s.maxSegmentBytes || s.clock().Sub(s.activeOpenedAt) >= s.flushInterval {
 		return s.sealActiveSegment()
@@ -392,15 +478,17 @@ func (s *SealedGzipSink) openStagingSegment() error {
 	now := s.clock()
 	stagingName := fmt.Sprintf(".staging-%s-%d-%06d.jsonl.gz.tmp", s.podName, now.UnixNano(), s.seq)
 	stagingPath := filepath.Join(s.stagingDir, stagingName)
-	f, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) // #nosec G304 -- internal staging path
+	f, err := s.stagingRoot.OpenFile(stagingName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, sinkFilePerm)
 	if err != nil {
 		return fmt.Errorf("failed to open staging trace segment %q: %w", stagingPath, err)
 	}
 	s.activeFile = f
 	s.activeGzip = gzip.NewWriter(f)
 	s.activePath = stagingPath
+	s.activeStagingName = stagingName
 	s.activeOpenedAt = now
 	s.activeUncompBytes = 0
+	s.activeName.Store(stagingName)
 	return nil
 }
 
@@ -411,61 +499,79 @@ func (s *SealedGzipSink) sealActiveSegment() error {
 	gz := s.activeGzip
 	f := s.activeFile
 	stagingPath := s.activePath
+	stagingName := s.activeStagingName
 	seq := s.seq
 
 	s.activeGzip = nil
 	s.activeFile = nil
 	s.activePath = ""
+	s.activeStagingName = ""
 	s.activeUncompBytes = 0
 
 	gzErr := gz.Close()
 	closeErr := f.Close()
 	if gzErr != nil {
-		_ = os.Remove(stagingPath)
+		_ = s.stagingRoot.Remove(stagingName)
 		return fmt.Errorf("failed to close gzip writer for %q: %w", stagingPath, gzErr)
 	}
 	if closeErr != nil {
-		_ = os.Remove(stagingPath)
+		_ = s.stagingRoot.Remove(stagingName)
 		return fmt.Errorf("failed to close staging file %q: %w", stagingPath, closeErr)
 	}
 
 	sealedName := fmt.Sprintf("%s-%d-%06d.jsonl.gz", s.podName, s.clock().UnixMilli(), seq)
 	sealedPath := filepath.Join(s.outputDir, sealedName)
 
-	if err := moveOrCopySealedFile(stagingPath, sealedPath); err != nil {
+	if err := s.moveOrCopySealedFile(stagingPath, stagingName, sealedPath, sealedName); err != nil {
 		return fmt.Errorf("failed to seal segment %q to %q: %w", stagingPath, sealedPath, err)
+	}
+
+	s.activeName.Store(sealedName)
+	s.rotations.Add(1)
+	rotationsMetric.WithLabelValues(s.pluginName).Inc()
+
+	if s.maxRotatedFiles > 0 {
+		s.rotatedFiles = append(s.rotatedFiles, sealedName)
+		for len(s.rotatedFiles) > s.maxRotatedFiles {
+			oldest := s.rotatedFiles[0]
+			s.rotatedFiles = s.rotatedFiles[1:]
+			if err := s.outputRoot.Remove(oldest); err != nil && !errors.Is(err, os.ErrNotExist) {
+				s.lastErr = err
+			}
+		}
 	}
 	return nil
 }
 
 // moveOrCopySealedFile renames src to dst when on the same mount, and falls back
-// to a single-open-write-close stream copy when StagingDir (/tmp emptyDir) and
-// OutputDir (/traces GCS FUSE CSI) reside on separate filesystems (EXDEV).
-func moveOrCopySealedFile(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
+// to a single-open-write-close stream copy confined to stagingRoot and outputRoot
+// when StagingDir (/tmp emptyDir) and OutputDir (/traces GCS FUSE CSI) reside on
+// separate filesystems (EXDEV).
+func (s *SealedGzipSink) moveOrCopySealedFile(srcPath, srcName, dstPath, dstName string) error {
+	if err := os.Rename(srcPath, dstPath); err == nil {
 		return nil
 	}
-	in, err := os.Open(src) // #nosec G304 -- internal staging path
+	in, err := s.stagingRoot.Open(srcName)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
 
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) // #nosec G304 -- configured trace output path
+	out, err := s.outputRoot.OpenFile(dstName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, sinkFilePerm)
 	if err != nil {
 		return err
 	}
 	if _, copyErr := io.Copy(out, in); copyErr != nil {
 		_ = out.Close()
-		_ = os.Remove(dst)
+		_ = s.outputRoot.Remove(dstName)
 		return copyErr
 	}
 	if closeErr := out.Close(); closeErr != nil {
-		_ = os.Remove(dst)
+		_ = s.outputRoot.Remove(dstName)
 		return closeErr
 	}
 	_ = in.Close()
-	_ = os.Remove(src)
+	_ = s.stagingRoot.Remove(srcName)
 	return nil
 }
 

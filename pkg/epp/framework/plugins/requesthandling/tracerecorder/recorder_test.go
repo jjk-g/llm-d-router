@@ -432,14 +432,14 @@ func TestAnonymization_ZeroCanaryLeakAnd53BitBounds(t *testing.T) {
 		assert.NotContains(t, uncompressedText, rawHashStr, "unkeyed raw block hash leaked into .jsonl.gz")
 	}
 
-	// Verify exact 23 JSON schema keys and 53-bit integer bounds.
+	// Verify exact JSON schema keys and 53-bit integer bounds.
 	var rawMap map[string]any
 	require.NoError(t, json.Unmarshal(bytes.TrimSpace(uncompressedBytes), &rawMap))
 	expectedKeys := []string{
-		"v", "key_fingerprint", "session_id", "session_source", "cache_salt_id",
+		"v", "key_fingerprint", "capture_run_id", "session_id", "session_source", "cache_salt_id",
 		"agent_id", "subagent_type", "t_recv_unix", "ttft_s", "api_time_s",
 		"streaming", "status_code", "termination", "model", "tokenizer_backend",
-		"block_size", "in", "out", "out_source", "msg_count",
+		"block_size", "in", "usage_in", "out", "out_source", "msg_count",
 		"has_system_prompt", "has_tools", "hash_ids",
 	}
 	assert.Len(t, rawMap, len(expectedKeys))
@@ -776,4 +776,138 @@ func TestResponseLifecycle_ReadOnlyOutFallbackAndNoStateLeaks(t *testing.T) {
 	pm, ok := reqOptIn.Body.Payload.AsMap()
 	require.True(t, ok)
 	assert.Equal(t, map[string]any{"include_usage": true}, pm[reqcommon.FieldStreamOptions])
+}
+
+func TestParentSessionHeaders_StreamCoalescing_AndLifecycleHardening(t *testing.T) {
+	t.Parallel()
+
+	secFile := writeSecretFile(t, testSecret32)
+	sink := NewMemoryTraceSink(0)
+	rec, err := NewRecorder(Config{SecretFilePath: secFile}, sink, time.Now)
+	require.NoError(t, err)
+	assert.Len(t, rec.CaptureRunID(), 32)
+
+	maxOut32 := int64(32)
+	rootReq := &scheduling.InferenceRequest{
+		RequestID:   "req-root",
+		TargetModel: "model-a",
+		Headers: map[string]string{
+			HeaderDynamoSessionID: "dyn-root-session",
+		},
+		Body: &fwkrequest.InferenceRequestBody{
+			MaxOutputTokens: &maxOut32,
+			TokenizedRequest: &fwkrequest.TokenizedRequest{
+				Prompts: []fwkrequest.PromptTokens{{TokenIDs: makeTokens(1, 32)}},
+			},
+		},
+	}
+	completeRequestLifecycle(t, rec, rootReq, &fwkrh.Response{
+		EndOfStream: true,
+		Headers:     map[string]string{":status": "200"},
+		Usage: fwkrequest.Usage{
+			PromptTokens:       32,
+			CompletionTokens:   8,
+			TotalTokens:        40,
+			PromptTokenDetails: &fwkrequest.PromptTokenDetails{CachedTokens: 16},
+		},
+	})
+
+	// Explicit parent session header + parallel streams (:s0 and :s1) coalescing.
+	for i, streamSuffix := range []string{"worker-7:s0", "worker-7:s1"} {
+		childReq := &scheduling.InferenceRequest{
+			RequestID:   fmt.Sprintf("req-child-%d", i),
+			TargetModel: "model-a",
+			Headers: map[string]string{
+				HeaderDynamoSessionID:       fmt.Sprintf("dyn-child-session-%d", i),
+				HeaderDynamoParentSessionID: "dyn-root-session",
+				HeaderClaudeCodeAgentID:     streamSuffix,
+			},
+			Body: &fwkrequest.InferenceRequestBody{
+				TokenizedRequest: &fwkrequest.TokenizedRequest{
+					Prompts: []fwkrequest.PromptTokens{{TokenIDs: makeTokens(100, 32)}},
+				},
+			},
+		}
+		completeRequestLifecycle(t, rec, childReq, &fwkrh.Response{
+			EndOfStream: true,
+			Headers:     map[string]string{":status": "200"},
+			Usage:       fwkrequest.Usage{PromptTokens: 32, CompletionTokens: 6, TotalTokens: 38},
+		})
+	}
+
+	evs := sink.Events()
+	require.Len(t, evs, 3)
+
+	// Root event has empty ParentSessionID, CachedTokens=16, UsageIn=32, MaxOutputTokens=32.
+	assert.Empty(t, evs[0].ParentSessionID)
+	assert.Equal(t, 32, evs[0].UsageIn)
+	assert.Equal(t, 16, evs[0].CachedTokens)
+	require.NotNil(t, evs[0].MaxOutputTokens)
+	assert.Equal(t, int64(32), *evs[0].MaxOutputTokens)
+
+	// Child events have ParentSessionID joining directly to root SessionID, and identical AgentID across :s0 and :s1.
+	assert.Equal(t, evs[0].SessionID, evs[1].ParentSessionID, "child parent_session_id must join directly to parent session_id")
+	assert.Equal(t, evs[0].SessionID, evs[2].ParentSessionID)
+	assert.NotEmpty(t, evs[1].AgentID)
+	assert.Equal(t, evs[1].AgentID, evs[2].AgentID, "parallel subagent streams :s0 and :s1 must coalesce to identical agent_id")
+
+	// Verify BindLiveness + OnEvicted holds in-flight state across staleness sweeps while liveCtx is active,
+	// and evicts + decrements inFlight once liveCtx cancels.
+	rec.pluginState = plugin.NewPluginState(
+		context.Background(),
+		plugin.WithStalenessThreshold(10*time.Millisecond),
+		plugin.WithCleanupInterval(5*time.Millisecond),
+	)
+	liveCtx, cancel := context.WithCancel(context.Background())
+	inFlightReq := &scheduling.InferenceRequest{
+		RequestID:   "req-inflight-cancel",
+		TargetModel: "model-a",
+		Headers:     map[string]string{HeaderCorrelationID: "corr-99"},
+		Body: &fwkrequest.InferenceRequestBody{
+			TokenizedRequest: &fwkrequest.TokenizedRequest{
+				Prompts: []fwkrequest.PromptTokens{{TokenIDs: makeTokens(1, 16)}},
+			},
+		},
+	}
+	require.NoError(t, rec.Produce(liveCtx, inFlightReq, nil))
+	assert.Equal(t, int64(1), rec.InFlightRequests())
+
+	// Even after >2x staleness threshold, BindLiveness keeps the entry alive while liveCtx is not done.
+	time.Sleep(25 * time.Millisecond)
+	assert.Equal(t, int64(1), rec.InFlightRequests())
+	assert.True(t, rec.HasPendingState("req-inflight-cancel"))
+
+	rawDump, err := rec.DumpState()
+	require.NoError(t, err)
+	var dumped map[string]any
+	require.NoError(t, json.Unmarshal(rawDump, &dumped))
+	assert.Equal(t, rec.CaptureRunID(), dumped["captureRunId"])
+	assert.Equal(t, float64(1), dumped["inFlight"])
+
+	cancel()
+	require.Eventually(t, func() bool {
+		return rec.InFlightRequests() == 0 && !rec.HasPendingState("req-inflight-cancel")
+	}, 2*time.Second, 5*time.Millisecond, "BindLiveness cancellation must allow janitor to evict pendingRecord and decrement inFlight")
+}
+
+func TestDownsampleBlockHashes_MultiType(t *testing.T) {
+	t.Parallel()
+
+	u64s := []uint64{10, 20, 30, 40, 50, 60, 70, 80, 90}
+	dsU64, err := DownsampleBlockHashes(u64s, 16, 64)
+	require.NoError(t, err)
+	assert.Equal(t, []uint64{40, 80}, dsU64)
+
+	i64s := []int64{11, 22, 33, 44, 55, 66}
+	dsI64, err := DownsampleBlockHashes(i64s, 16, 32)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{22, 44, 66}, dsI64)
+
+	strs := []string{"h0", "h1", "h2", "h3", "h4"}
+	dsStr, err := DownsampleBlockHashes(strs, 16, 32)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"h1", "h3"}, dsStr)
+
+	_, err = DownsampleBlockHashes(strs, 16, 24)
+	require.Error(t, err)
 }

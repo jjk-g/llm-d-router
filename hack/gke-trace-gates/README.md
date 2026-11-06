@@ -1,6 +1,6 @@
-# GKE Verification Harness for `kv-block-trace-recorder` (Gates 3 & 4)
+# GKE Verification Harness for `kv-block-trace-recorder` (Gates 3, 4 & 5)
 
-Self-contained Google Kubernetes Engine (GKE) verification harness for the `kv-block-trace-recorder` Endpoint Picker (EPP) plugin (`llm-d-router`) and offline `epp-trace-compact` + `weka_trace_replay` pipeline (`inference-perf`).
+Self-contained Google Kubernetes Engine (GKE) verification harness for the `kv-block-trace-recorder` Endpoint Picker (EPP) plugin (`llm-d-router`), `cmd/trace-export`, and offline `epp-trace-compact` + `weka_trace_replay` / `aiperf` AgentX pipeline (`inference-perf`).
 
 ## Environment Configuration
 
@@ -42,7 +42,13 @@ export GCP_REGION="us-central1"
 # 5. Run Gate 4 (1x real vLLM + live vs. replay prefix-cache hit-rate parity + 200-req p99 overhead)
 ./scripts/run-gke-gates.sh gate4
 
-# 6. Run full end-to-end suite (create-bucket -> build-push -> preflight -> gate3 -> gate4)
+# 6. Run Gate 5 locally (hermetic live-EPP + aiperf & inference-perf AgentX smoke tests + round-trip replay)
+./scripts/run-gke-gates.sh gate5-local
+
+# 7. Run Gate 5 on GKE cluster (live GKE EPP stack + aiperf & inference-perf AgentX smoke tests)
+./scripts/run-gke-gates.sh gate5
+
+# 8. Run full end-to-end suite (create-bucket -> build-push -> preflight -> gate3 -> gate4 -> gate5)
 ./scripts/run-gke-gates.sh all
 ```
 

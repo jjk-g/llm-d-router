@@ -42,6 +42,11 @@ func (dk DataKey) WithNonEmptyProducerName(name string) DataKey {
 	return dk
 }
 
+// DataType returns the underlying data type identifier of the key.
+func (dk DataKey) DataType() string {
+	return dk.dataType
+}
+
 // String serializes the key to "DataType/ProducerName".
 func (dk DataKey) String() string {
 	return fmt.Sprintf("%s/%s", dk.dataType, dk.producerName)
