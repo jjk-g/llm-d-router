@@ -1070,6 +1070,20 @@ use the labels shown below.
 | `llm_d_epp_kv_cache_events_pool_queue_depth` | Gauge | - | Messages queued across event-pool workers. |
 | `llm_d_epp_kv_cache_events_pool_capacity` | Gauge | - | Event-pool worker capacity. |
 
+### KV-block trace recorder
+
+These metrics belong to the `kv-block-trace-recorder` plugin. They are registered when the plugin is
+configured and track non-blocking trace segment persistence, backpressure drops, cohort-sampling skips,
+and segment rotations.
+
+| Full metric name | Type | Labels | Notes |
+|---|---|---|---|
+| `llm_d_epp_trace_recorder_written_events_total` | Counter | `plugin_name` | Anonymized KV-block trace events persisted by the trace sink. |
+| `llm_d_epp_trace_recorder_dropped_events_total` | Counter | `plugin_name` | Anonymized KV-block trace events dropped due to sink backpressure or post-close enqueue. |
+| `llm_d_epp_trace_recorder_dropped_records_total` | Counter | `plugin_name`, `reason` | Anonymized KV-block trace records dropped before persistence (`reason` is `buffer_full`, `sink_closed`, or `write_error`). |
+| `llm_d_epp_trace_recorder_skipped_requests_total` | Counter | `plugin_name`, `reason` | Inference requests skipped by the trace recorder (`reason` is `sampled_out`, `no_tokens`, or `non_completed`). |
+| `llm_d_epp_trace_recorder_rotations_total` | Counter | `plugin_name` | Sealed `.jsonl.gz` trace segment rotations performed by the trace sink. |
+
 ### P/D sidecar request and stage metrics
 
 Emitted by the sidecar proxy on its `/metrics` endpoint; see [P/D sidecar](#pd-sidecar) for

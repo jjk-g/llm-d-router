@@ -60,3 +60,4 @@ config/charts/*/Chart.lock
 # Performance benchmark local results directory
 test/perf/__pycache__/
 test/perf/results/
+hack/gke-trace-gates/__pycache__/

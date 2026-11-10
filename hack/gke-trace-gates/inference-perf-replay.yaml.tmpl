@@ -1,0 +1,54 @@
+# Copyright 2026 The llm-d Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load:
+  type: trace_session_replay
+  stages:
+    - concurrent_sessions: __CONCURRENT_SESSIONS__
+      num_sessions: __NUM_SESSIONS__
+  num_workers: __NUM_WORKERS__
+  worker_max_concurrency: 32
+  request_timeout: 120
+api:
+  type: chat
+  streaming: true
+  session_id_header_key: "x-llm-d-inference-fairness-id"
+server:
+  type: vllm
+  model_name: "__MODEL_NAME__"
+  base_url: "__BASE_URL__"
+tokenizer:
+  pretrained_model_name_or_path: "__MODEL_NAME__"
+data:
+  type: weka_trace_replay
+  weka_trace_replay:
+    trace_directory: "__TRACE_DIR__"
+    global_hash_scope: true
+    separate_subagent_session_ids: false
+    trace_idle_gap_cap_seconds: 1.0
+    default_block_size: 16
+    use_static_model: true
+    static_model_name: "__MODEL_NAME__"
+    skip_invalid_files: false
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+    per_request_fields:
+      request: false
+      response: false
+      response_chunks: false
+      info: true
+      computed_metrics: true

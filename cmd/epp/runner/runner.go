@@ -135,6 +135,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/screener/endpointpin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/selectivekv"
 	testresponsereceived "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/test/responsereceived"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/tracerecorder"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	endpointattributefilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointattribute"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointhealth"
@@ -831,6 +832,7 @@ func (r *Runner) registerInTreePlugins() {
 	// register request control plugins
 	// Beta
 	fwkplugin.Register(requestattributereporter.RequestAttributeReporterType, fwkplugin.StabilityBeta, requestattributereporter.RequestAttributeReporterPluginFactory)
+	fwkplugin.Register(tracerecorder.PluginType, fwkplugin.StabilityBeta, tracerecorder.PluginFactory)
 	fwkplugin.Register(openai.OpenAIParserType, fwkplugin.StabilityBeta, openai.OpenAIParserPluginFactory)
 	fwkplugin.Register(vllmgrpc.VllmGRPCParserType, fwkplugin.StabilityBeta, vllmgrpc.VllmGRPCParserPluginFactory)
 	fwkplugin.Register(passthrough.PassthroughParserType, fwkplugin.StabilityBeta, passthrough.PassthroughParserPluginFactory)
