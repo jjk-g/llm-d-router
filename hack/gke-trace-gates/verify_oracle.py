@@ -1186,6 +1186,7 @@ def verify_gate5(
         errors.append(f"No WekaTrace records found in exported_path={exported_path}")
 
     # 1. Dual Schema Validation & 2. Block Invariant
+    pre_schema_err_count = len(errors)
     total_clamped = 0
     total_turns_checked = 0
     total_block_violations = 0
@@ -1194,6 +1195,7 @@ def verify_gate5(
         total_clamped += res["clamped_request_count"]
         total_turns_checked += res["block_invariant_checked"]
         total_block_violations += res["block_invariant_violations"]
+    schema_valid = (len(errors) == pre_schema_err_count) and len(exported_traces) > 0
 
     # 3. Tokenizer Parity (on raw captured EPP records if provided, plus exported turn totals)
     captured_turns_checked = 0
@@ -1419,7 +1421,7 @@ def verify_gate5(
         "gate": "gate5",
         "passed": len(errors) == 0,
         "schema_validation": {
-            "aiperf_strict_extra_forbid": len(errors) == 0,
+            "aiperf_strict_extra_forbid": schema_valid,
             "clamped_request_count": total_clamped,
             "forbidden_raw_keys_found": 0,
         },

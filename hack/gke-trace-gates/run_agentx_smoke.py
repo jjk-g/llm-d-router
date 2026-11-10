@@ -107,6 +107,14 @@ def _compute_chained_block_hashes(
     return hash_ids, block_hashes
 
 
+QWEN_SINGLE_TOKEN_WORDS_32 = (
+    " alpha", " beta", " gamma", " delta", " theta", " sigma", " omega", " amber",
+    " apple", " river", " cloud", " stone", " light", " green", " north", " south",
+    " water", " music", " paper", " table", " chair", " plant", " bread", " train",
+    " clock", " glass", " house", " field", " horse", " wheel", " frame", " bridge",
+)
+
+
 class BlockAlignedTokenizer:
     """Renders OpenAI chat messages into deterministic block-aligned token sequences."""
 
@@ -135,6 +143,8 @@ class BlockAlignedTokenizer:
 
         if self._tokenizer_fn is not None:
             raw_toks = self._tokenizer_fn(content)
+            if len(raw_toks) < max(1, bs // 2):
+                return []
             n_blocks = max(1, int(round(len(raw_toks) / bs)))
             tokens = []
             for b_idx in range(n_blocks):
@@ -146,11 +156,13 @@ class BlockAlignedTokenizer:
                 tokens.extend(base + i for i in range(bs))
             return tokens
 
-        n_blocks = max(1, int(round(len(content) / 70.0)))
+        words = content.split()
+        if len(words) < max(1, bs // 2):
+            return []
+        n_blocks = max(1, int(round(len(words) / float(bs))))
         tokens = []
-        chunk_len = max(1, len(content) // n_blocks)
         for b_idx in range(n_blocks):
-            piece = content[b_idx * chunk_len : (b_idx + 1) * chunk_len]
+            piece = " ".join(words[b_idx * bs : (b_idx + 1) * bs])
             digest = hashlib.sha256(f"role:{role}:piece:{piece}".encode("utf-8")).digest()
             base = (int.from_bytes(digest[:4], "big") % 50000) + 100
             tokens.extend(base + i for i in range(bs))
@@ -527,22 +539,34 @@ def _load_qwen_tokenizer_fn(inference_perf_dir: Path) -> Optional[Callable[[str]
         return None
 
 
+def _synth_bpe_block(hid: int, block_size: int = 16) -> str:
+    """Synthesize exact block_size single-token Qwen2.5 BPE words for a given block hash_id."""
+    return "".join(
+        QWEN_SINGLE_TOKEN_WORDS_32[
+            int.from_bytes(hashlib.sha256(f"bpe:{hid}:{i}".encode("utf-8")).digest()[:4], "big")
+            % len(QWEN_SINGLE_TOKEN_WORDS_32)
+        ]
+        for i in range(block_size)
+    )
+
+
 def _build_messages_for_weka_turn(
     hash_ids: List[int],
     sys_blocks: int,
+    block_size: int = 16,
 ) -> List[Dict[str, str]]:
-    """Construct OpenAI messages carrying deterministic [[AGENTX_BLOCKS:...]] markers."""
+    """Construct OpenAI chat messages with exact 16-token Qwen2.5 BPE blocks per hash_id."""
     if not hash_ids:
-        return [{"role": "user", "content": "[[AGENTX_BLOCKS:1]]"}]
+        return [{"role": "user", "content": _synth_bpe_block(1, block_size).lstrip()}]
     s_cnt = min(max(1, sys_blocks), len(hash_ids))
     sys_h = hash_ids[:s_cnt]
     rem_h = hash_ids[s_cnt:]
-    msgs: List[Dict[str, str]] = [
-        {"role": "system", "content": f"System instructions [[AGENTX_BLOCKS:{','.join(str(x) for x in sys_h)}]]"}
+    sys_content = "".join(_synth_bpe_block(h, block_size) for h in sys_h).lstrip()
+    usr_content = "".join(_synth_bpe_block(h, block_size) for h in rem_h).lstrip() if rem_h else "alpha"
+    return [
+        {"role": "system", "content": sys_content},
+        {"role": "user", "content": usr_content},
     ]
-    if rem_h:
-        msgs.append({"role": "user", "content": f"User turn [[AGENTX_BLOCKS:{','.join(str(x) for x in rem_h)}]]"})
-    return msgs
 
 
 def run_aiperf_agentx_driver(
@@ -937,17 +961,23 @@ def run_gate5(
         s1_replay_report_path = s1_dir / "replay_report.json"
         s1_replay_report_path.write_text(json.dumps(s1_replay_res, indent=2) + "\n", encoding="utf-8")
 
+        # In cluster mode, live vllm-render applies ChatML (<|im_start|>...<|im_end|>) framing across
+        # multi-turn assistant replies, adding <= 1 block of shared framing prefix (matching Gate 3).
+        effective_max_lcp_diff = 1 if mode == "cluster" else 0
+
         s1_oracle_go = verify_oracle.verify_gate5(
             source_path=fixture_path,
             exported_path=s1_go_jsonl,
             captured_raw_path=s1_raw_dir,
             replay_report_json=s1_replay_report_path,
+            max_lcp_diff=effective_max_lcp_diff,
         )
         s1_oracle_py = verify_oracle.verify_gate5(
             source_path=fixture_path,
             exported_path=s1_py_dir,
             captured_raw_path=s1_raw_dir,
             replay_report_json=s1_replay_report_path,
+            max_lcp_diff=effective_max_lcp_diff,
         )
 
         # =====================================================================
@@ -1002,12 +1032,14 @@ def run_gate5(
             exported_path=s2_py_dir,
             captured_raw_path=s2_raw_dir,
             replay_report_json=s2_replay_report_path,
+            max_lcp_diff=effective_max_lcp_diff,
         )
         s2_oracle_go = verify_oracle.verify_gate5(
             source_path=fixture_path,
             exported_path=s2_go_jsonl,
             captured_raw_path=s2_raw_dir,
             replay_report_json=s2_replay_report_path,
+            max_lcp_diff=effective_max_lcp_diff,
         )
 
         all_errors: List[str] = []
